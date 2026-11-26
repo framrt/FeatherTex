@@ -6,7 +6,7 @@ use crate::symbols::{
     FormulaItem, LibraryCategory, PaletteTab, SymbolItem, FORMULAS, GREEK_SYMBOLS, LIBRARY_PRESETS,
     LOGIC_SYMBOLS, MATH_LIBRARIES, MATH_SYMBOLS,
 };
-use crate::syntax::{LatexHighlighter, Token};
+use crate::syntax::{LatexHighlightSettings, LatexHighlighter, Token};
 use crate::theme;
 use crate::{App, LogTab, Message, PdfContextMenu, Screen};
 use iced::advanced::layout::{self, Layout};
@@ -450,6 +450,33 @@ fn view_editor(app: &App) -> Element<'_, Message> {
         .style(theme::ghost_button)
         .on_press(Message::GoHome);
 
+    let update_pill: Element<'_, Message> = if let Some(upd) = &app.available_update {
+        container(
+            row![
+                button(
+                    text(format!("Aggiornamento v{} · Scarica", upd.version))
+                        .font(theme::ui_font_semibold())
+                        .size(11)
+                        .color(pal.accent),
+                )
+                .padding([2, 6])
+                .style(theme::ghost_button)
+                .on_press(Message::OpenUpdateUrl),
+                button(text("×").size(12).color(pal.text_muted))
+                    .padding([1, 4])
+                    .style(theme::ghost_button)
+                    .on_press(Message::DismissUpdateBanner),
+            ]
+            .spacing(2)
+            .align_y(Alignment::Center),
+        )
+        .padding([1, 4])
+        .style(theme::status_pill(pal.accent, pal.accent_soft))
+        .into()
+    } else {
+        Space::with_width(Length::Fixed(0.0)).into()
+    };
+
     let theme_btn_label = if app.dark_mode { "Chiaro" } else { "Scuro" };
 
     let log_btn_label = if tab.lint_warnings.is_empty() {
@@ -461,6 +488,7 @@ fn view_editor(app: &App) -> Element<'_, Message> {
     let top_bar = container(
         row![
             brand_btn,
+            update_pill,
             horizontal_space(),
             button(text("Nuovo").size(13))
                 .padding(bar_btn_pad)
@@ -1528,9 +1556,15 @@ fn view_editor_canvas(app: &App) -> Element<'_, Message> {
         .selection()
         .is_some_and(|s| !s.is_empty());
 
+    let hl_settings = LatexHighlightSettings {
+        dark_mode: app.dark_mode,
+        revision: tab.doc.highlight_revision,
+        misspelled: tab.misspelled_words.clone(),
+    };
+
     let mut editor_widget = text_editor(&tab.doc.content)
         .on_action(Message::EditorAction)
-        .highlight_with::<LatexHighlighter>(app.dark_mode, Token::to_format)
+        .highlight_with::<LatexHighlighter>(hl_settings, Token::to_format)
         .font(theme::mono_font())
         .size(font_size)
         .line_height(LineHeight::Absolute(line_height.into()))
@@ -1645,8 +1679,23 @@ fn view_editor_canvas(app: &App) -> Element<'_, Message> {
                             return Some(text_editor::Binding::Custom(Message::IndentSelection));
                         }
                         return Some(text_editor::Binding::Insert('\t'));
+                    } else if matches!(
+                        key_press.key.as_ref(),
+                        keyboard::Key::Named(keyboard::key::Named::Delete)
+                    ) {
+                        return Some(text_editor::Binding::Delete);
                     }
                 }
+            }
+            if key_press.status == text_editor::Status::Focused
+                && !key_press.modifiers.command()
+                && !key_press.modifiers.alt()
+                && matches!(
+                    key_press.key.as_ref(),
+                    keyboard::Key::Named(keyboard::key::Named::Delete)
+                )
+            {
+                return Some(text_editor::Binding::Delete);
             }
             text_editor::Binding::from_key_press(key_press)
         });
@@ -2260,6 +2309,12 @@ fn view_pdf_panel(app: &App) -> Element<'_, Message> {
                     .padding(hdr_btn_pad)
                     .style(theme::ghost_button)
                     .on_press(Message::SyncPdfToLastEdit),
+            )
+            .push(
+                button(text("Salva PDF").size(11))
+                    .padding(hdr_btn_pad)
+                    .style(theme::ghost_button)
+                    .on_press(Message::SavePdfAs),
             )
             .push(
                 button(text("Esterno").size(11))
@@ -3742,6 +3797,20 @@ fn view_log_panel(app: &App) -> Element<'_, Message> {
                         None => "Errore".to_string(),
                     };
 
+                    let mut copy_payload = String::new();
+                    if let Some(line) = diag.line {
+                        copy_payload.push_str(&format!("Riga {line}: "));
+                    }
+                    copy_payload.push_str(&diag.title);
+                    if !diag.explanation.is_empty() {
+                        copy_payload.push_str("\n");
+                        copy_payload.push_str(&diag.explanation);
+                    }
+                    if !diag.raw_excerpt.is_empty() {
+                        copy_payload.push_str("\n");
+                        copy_payload.push_str(&diag.raw_excerpt);
+                    }
+
                     let mut card_top = row![
                         container(
                             text(line_pill_label)
@@ -3752,16 +3821,31 @@ fn view_log_panel(app: &App) -> Element<'_, Message> {
                         .padding([2, 7])
                         .style(theme::missing_badge),
                         horizontal_space(),
+                        button(
+                            text("Copia")
+                                .font(theme::ui_font_semibold())
+                                .size(11)
+                                .color(pal.text_muted),
+                        )
+                        .padding([2, 7])
+                        .style(theme::ghost_button)
+                        .on_press(Message::CopyText(copy_payload)),
                     ]
+                    .spacing(6)
                     .align_y(Alignment::Center);
 
-                    if diag.line.is_some() {
+                    if let Some(line) = diag.line {
                         card_top = card_top.push(
-                            text("Vai alla riga ↗")
-                                .font(theme::math_symbol_font())
-                                .shaping(Shaping::Advanced)
-                                .size(11)
-                                .color(pal.accent),
+                            button(
+                                text("Vai alla riga ↗")
+                                    .font(theme::math_symbol_font())
+                                    .shaping(Shaping::Advanced)
+                                    .size(11)
+                                    .color(pal.accent),
+                            )
+                            .padding([2, 7])
+                            .style(theme::ghost_button)
+                            .on_press(Message::JumpToLine(line)),
                         );
                     }
 
@@ -3785,15 +3869,9 @@ fn view_log_panel(app: &App) -> Element<'_, Message> {
                     .spacing(6)
                     .padding([8, 10]);
 
-                    let card_btn = button(card_body)
+                    let card = container(card_body)
                         .width(Length::Fill)
-                        .style(theme::error_card_button);
-
-                    let card: Element<'_, Message> = if let Some(line) = diag.line {
-                        card_btn.on_press(Message::JumpToLine(line)).into()
-                    } else {
-                        card_btn.into()
-                    };
+                        .style(theme::welcome_card);
 
                     content_col = content_col.push(card);
                 }
@@ -3806,27 +3884,73 @@ fn view_log_panel(app: &App) -> Element<'_, Message> {
             };
 
             content_col = content_col.push(
-                button(
-                    text(raw_toggle_label)
-                        .font(theme::ui_font_semibold())
-                        .size(11)
-                        .color(pal.text_muted),
-                )
-                .padding([5, 10])
-                .style(theme::ghost_button)
-                .on_press(Message::ToggleRawLog),
+                row![
+                    button(
+                        text(raw_toggle_label)
+                            .font(theme::ui_font_semibold())
+                            .size(11)
+                            .color(pal.text_muted),
+                    )
+                    .padding([5, 10])
+                    .style(theme::ghost_button)
+                    .on_press(Message::ToggleRawLog),
+                    button(
+                        text("Copia log")
+                            .font(theme::ui_font_semibold())
+                            .size(11)
+                            .color(pal.text_muted),
+                    )
+                    .padding([5, 10])
+                    .style(theme::ghost_button)
+                    .on_press(Message::CopyText(tab.compile_log.clone())),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
             );
 
             if tab.show_raw_log || tab.diagnostics.is_empty() {
-                let log_box = container(
-                    text(&tab.compile_log)
-                        .font(theme::mono_font())
-                        .size(11)
-                        .color(pal.text_primary),
-                )
-                .padding(12)
-                .width(Length::Fill)
-                .style(theme::log_inset);
+                let log_editor = text_editor(&tab.compile_log_content)
+                    .on_action(Message::LogViewerAction)
+                    .font(theme::mono_font())
+                    .size(11)
+                    .padding(10)
+                    .height(Length::Shrink)
+                    .style(theme::editor_style)
+                    .key_binding(|key_press| {
+                        if key_press.status == text_editor::Status::Focused
+                            && key_press.modifiers.command()
+                            && !key_press.modifiers.alt()
+                        {
+                            match key_press.key.as_ref() {
+                                keyboard::Key::Character("c" | "C") => {
+                                    return Some(text_editor::Binding::Custom(
+                                        Message::CopyLogSelection,
+                                    ));
+                                }
+                                keyboard::Key::Character("a" | "A") => {
+                                    return Some(text_editor::Binding::SelectAll);
+                                }
+                                _ => {}
+                            }
+                        }
+                        let binding = text_editor::Binding::<Message>::from_key_press(key_press);
+                        if matches!(
+                            binding,
+                            Some(
+                                text_editor::Binding::Copy
+                                    | text_editor::Binding::SelectAll
+                                    | text_editor::Binding::Move(_)
+                                    | text_editor::Binding::Select(_)
+                            )
+                        ) {
+                            return binding;
+                        }
+                        None
+                    });
+
+                let log_box = container(log_editor)
+                    .width(Length::Fill)
+                    .style(theme::log_inset);
 
                 content_col = content_col.push(log_box);
             }

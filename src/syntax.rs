@@ -1,7 +1,16 @@
 use crate::theme;
 use iced::advanced::text::highlighter::{self, Highlighter};
 use iced::{Color, Font, Theme};
+use std::collections::HashSet;
 use std::ops::Range;
+use std::sync::Arc;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LatexHighlightSettings {
+    pub dark_mode: bool,
+    pub revision: u64,
+    pub misspelled: Arc<HashSet<String>>,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum Token {
@@ -13,6 +22,7 @@ pub enum Token {
     MathCommand,
     Bracket,
     Number,
+    Misspelled,
 }
 
 impl Token {
@@ -30,6 +40,7 @@ impl Token {
                 Token::MathCommand => (Color::from_rgb(0.329, 0.855, 0.816), Some(bold_mono)),
                 Token::Bracket => (Color::from_rgb(0.922, 0.655, 0.333), Some(bold_mono)),
                 Token::Number => (Color::from_rgb(0.929, 0.545, 0.431), None),
+                Token::Misspelled => (Color::from_rgb(0.980, 0.360, 0.360), Some(bold_mono)),
             }
         } else {
             match self {
@@ -41,6 +52,7 @@ impl Token {
                 Token::MathCommand => (Color::from_rgb(0.027, 0.388, 0.365), Some(bold_mono)),
                 Token::Bracket => (Color::from_rgb(0.588, 0.302, 0.039), Some(bold_mono)),
                 Token::Number => (Color::from_rgb(0.663, 0.212, 0.090), None),
+                Token::Misspelled => (Color::from_rgb(0.840, 0.120, 0.120), Some(bold_mono)),
             }
         };
 
@@ -53,24 +65,24 @@ impl Token {
 
 pub struct LatexHighlighter {
     current_line: usize,
-    dark_mode: bool,
+    settings: LatexHighlightSettings,
 }
 
 impl Highlighter for LatexHighlighter {
-    type Settings = bool;
+    type Settings = LatexHighlightSettings;
     type Highlight = Token;
     type Iterator<'a> = std::vec::IntoIter<(Range<usize>, Token)>;
 
     fn new(settings: &Self::Settings) -> Self {
         Self {
             current_line: 0,
-            dark_mode: *settings,
+            settings: settings.clone(),
         }
     }
 
     fn update(&mut self, new_settings: &Self::Settings) {
-        if self.dark_mode != *new_settings {
-            self.dark_mode = *new_settings;
+        if self.settings != *new_settings {
+            self.settings = new_settings.clone();
             self.current_line = 0;
         }
     }
@@ -81,7 +93,7 @@ impl Highlighter for LatexHighlighter {
 
     fn highlight_line(&mut self, line: &str) -> Self::Iterator<'_> {
         self.current_line += 1;
-        tokenize_line(line).into_iter()
+        tokenize_line(line, &self.settings.misspelled).into_iter()
     }
 
     fn current_line(&self) -> usize {
@@ -89,13 +101,50 @@ impl Highlighter for LatexHighlighter {
     }
 }
 
-fn tokenize_line(line: &str) -> Vec<(Range<usize>, Token)> {
+fn is_non_prose_brace_command(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "\\begin"
+            | "\\end"
+            | "\\usepackage"
+            | "\\documentclass"
+            | "\\label"
+            | "\\ref"
+            | "\\eqref"
+            | "\\cref"
+            | "\\Cref"
+            | "\\autoref"
+            | "\\pageref"
+            | "\\cite"
+            | "\\parencite"
+            | "\\textcite"
+            | "\\citet"
+            | "\\citep"
+            | "\\input"
+            | "\\include"
+            | "\\subfile"
+            | "\\bibliography"
+            | "\\bibliographystyle"
+            | "\\addbibresource"
+            | "\\includegraphics"
+            | "\\includesvg"
+            | "\\graphicspath"
+            | "\\url"
+            | "\\href"
+            | "\\usetikzlibrary"
+            | "\\usetheme"
+            | "\\usecolortheme"
+    )
+}
+
+fn tokenize_line(line: &str, misspelled: &HashSet<String>) -> Vec<(Range<usize>, Token)> {
     let mut tokens = Vec::new();
     let bytes = line.as_bytes();
     let len = bytes.len();
     let mut i = 0;
     let mut in_math = false;
     let mut expect_env_name = false;
+    let mut skip_non_prose_brace = false;
 
     while i < len {
         let b = bytes[i];
@@ -112,6 +161,8 @@ fn tokenize_line(line: &str) -> Vec<(Range<usize>, Token)> {
                 i += 1;
             }
             in_math = !in_math;
+            expect_env_name = false;
+            skip_non_prose_brace = false;
             tokens.push((start..i, Token::Math));
             continue;
         }
@@ -135,6 +186,7 @@ fn tokenize_line(line: &str) -> Vec<(Range<usize>, Token)> {
 
             let cmd = &line[start..i];
             expect_env_name = matches!(cmd, "\\begin" | "\\end");
+            skip_non_prose_brace = is_non_prose_brace_command(cmd);
 
             let kind = match cmd {
                 "\\documentclass"
@@ -173,10 +225,15 @@ fn tokenize_line(line: &str) -> Vec<(Range<usize>, Token)> {
                 | "\\cref"
                 | "\\Cref"
                 | "\\cite"
+                | "\\parencite"
+                | "\\citet"
+                | "\\citep"
                 | "\\input"
                 | "\\include"
                 | "\\bibliography"
-                | "\\bibliographystyle" => Token::Keyword,
+                | "\\bibliographystyle"
+                | "\\addbibresource"
+                | "\\frametitle" => Token::Keyword,
                 "\\[" | "\\]" | "\\(" | "\\)" => {
                     in_math = matches!(cmd, "\\[" | "\\(");
                     Token::Math
@@ -205,10 +262,62 @@ fn tokenize_line(line: &str) -> Vec<(Range<usize>, Token)> {
                 i += 1;
             }
             expect_env_name = false;
+            skip_non_prose_brace = false;
             continue;
         }
 
         expect_env_name = false;
+
+        if b == b'[' && skip_non_prose_brace {
+            tokens.push((i..i + 1, Token::Bracket));
+            i += 1;
+            let mut depth = 1usize;
+            while i < len && depth > 0 {
+                if bytes[i] == b'[' {
+                    depth += 1;
+                    tokens.push((i..i + 1, Token::Bracket));
+                    i += 1;
+                } else if bytes[i] == b']' {
+                    depth -= 1;
+                    tokens.push((i..i + 1, Token::Bracket));
+                    i += 1;
+                } else if bytes[i] == b'%' {
+                    break;
+                } else {
+                    let ch = line[i..].chars().next().unwrap();
+                    i += ch.len_utf8();
+                }
+            }
+            continue;
+        }
+
+        if b == b'{' && skip_non_prose_brace {
+            tokens.push((i..i + 1, Token::Bracket));
+            i += 1;
+            let mut depth = 1usize;
+            while i < len && depth > 0 {
+                if bytes[i] == b'{' {
+                    depth += 1;
+                    tokens.push((i..i + 1, Token::Bracket));
+                    i += 1;
+                } else if bytes[i] == b'}' {
+                    depth -= 1;
+                    tokens.push((i..i + 1, Token::Bracket));
+                    i += 1;
+                } else if bytes[i] == b'%' {
+                    break;
+                } else {
+                    let ch = line[i..].chars().next().unwrap();
+                    i += ch.len_utf8();
+                }
+            }
+            skip_non_prose_brace = false;
+            continue;
+        }
+
+        if !b.is_ascii_whitespace() {
+            skip_non_prose_brace = false;
+        }
 
         if matches!(b, b'{' | b'}' | b'[' | b']') {
             tokens.push((i..i + 1, Token::Bracket));
@@ -243,6 +352,23 @@ fn tokenize_line(line: &str) -> Vec<(Range<usize>, Token)> {
         }
 
         let ch = line[i..].chars().next().unwrap();
+        if !misspelled.is_empty() && ch.is_alphabetic() {
+            let start = i;
+            i += ch.len_utf8();
+            while i < len {
+                let next_ch = line[i..].chars().next().unwrap();
+                if next_ch.is_alphabetic() {
+                    i += next_ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let word = &line[start..i];
+            if misspelled.contains(word) || misspelled.contains(&word.to_lowercase()) {
+                tokens.push((start..i, Token::Misspelled));
+            }
+            continue;
+        }
         i += ch.len_utf8();
     }
 

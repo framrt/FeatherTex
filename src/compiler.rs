@@ -238,6 +238,19 @@ fn live_dir_for(parent_dir: &Path) -> PathBuf {
     }
 }
 
+/// Atomically mirrors the built PDF from `.build/<stem>.pdf` to `<project_dir>/<stem>.pdf`
+/// so users always see their compiled PDF right beside their `.tex` file (like a standard editor),
+/// while keeping auxiliary files tidy inside `.build/`.
+fn mirror_pdf_to_project_dir(build_pdf: &Path, project_dir: &Path, file_name: &std::ffi::OsStr) {
+    if !build_pdf.exists() {
+        return;
+    }
+    let user_pdf = project_dir.join(file_name);
+    if let Ok(bytes) = std::fs::read(build_pdf) {
+        let _ = crate::document::write_file_atomic_sync(&user_pdf, &bytes);
+    }
+}
+
 /// Atomically moves `src` to `dst`, transparently falling back to copy + sibling-temp atomic
 /// rename when crossing filesystems (e.g., `/dev/shm` tmpfs -> disk `.build/`).
 fn move_file_atomic_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -678,6 +691,9 @@ pub fn promote_staged_live_result(mut result: CompileResult) -> Result<CompileRe
     if live_pdf.exists() {
         move_file_atomic_or_copy(&live_pdf, &final_pdf)
             .map_err(|e| format!("Impossibile promuovere il PDF pre-compilato: {e}"))?;
+        if let Some(proj_dir) = build_dir.parent() {
+            mirror_pdf_to_project_dir(&final_pdf, proj_dir, file_name);
+        }
     }
 
     if let Some(stem) = live_pdf.file_stem().and_then(|s| s.to_str()) {
@@ -1283,6 +1299,9 @@ pub async fn compile_with_recipe(
 
     let pdf_candidate = build_dir.join(format!("{stem}.pdf"));
     let pdf_path = if pipeline_ok && pdf_candidate.exists() {
+        if let Some(pdf_fname) = pdf_candidate.file_name() {
+            mirror_pdf_to_project_dir(&pdf_candidate, parent_dir, pdf_fname);
+        }
         Some(pdf_candidate)
     } else {
         None
@@ -2253,17 +2272,86 @@ fn diagnose_missing_packages(log: &str) -> Option<String> {
 }
 
 pub fn open_pdf_external(pdf_path: &Path) {
+    let preferred = user_facing_pdf_path(pdf_path);
+    let target = if preferred.exists() {
+        preferred.as_path()
+    } else {
+        pdf_path
+    };
+
     #[cfg(target_os = "linux")]
-    let _ = std::process::Command::new("xdg-open").arg(pdf_path).spawn();
+    let _ = std::process::Command::new("xdg-open").arg(target).spawn();
 
     #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(pdf_path).spawn();
+    let _ = std::process::Command::new("open").arg(target).spawn();
 
     #[cfg(target_os = "windows")]
     let _ = std::process::Command::new("rundll32.exe")
         .arg("url.dll,FileProtocolHandler")
-        .arg(pdf_path)
+        .arg(target)
         .spawn();
+}
+
+pub fn open_url_external(url: &str) {
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(url).spawn();
+
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("rundll32.exe")
+        .arg("url.dll,FileProtocolHandler")
+        .arg(url)
+        .spawn();
+}
+
+/// Returns `<project_dir>/<name>.pdf` when given `.build/<name>.pdf`.
+pub fn user_facing_pdf_path(pdf_path: &Path) -> PathBuf {
+    if let (Some(fname), Some(build_dir)) = (pdf_path.file_name(), pdf_path.parent()) {
+        if build_dir.file_name().and_then(|n| n.to_str()) == Some(".build") {
+            if let Some(proj_dir) = build_dir.parent() {
+                return proj_dir.join(fname);
+            }
+        }
+    }
+    pdf_path.to_path_buf()
+}
+
+pub async fn export_pdf_as(
+    source_pdf: PathBuf,
+    default_name: String,
+    default_dir: Option<PathBuf>,
+) -> Result<PathBuf, String> {
+    let mut dialog = rfd::AsyncFileDialog::new()
+        .set_title("Salva PDF")
+        .add_filter("Documento PDF", &["pdf"])
+        .set_file_name(&default_name);
+    if let Some(dir) = default_dir {
+        if dir.is_dir() {
+            dialog = dialog.set_directory(dir);
+        }
+    }
+    let handle = dialog
+        .save_file()
+        .await
+        .ok_or_else(|| "Esportazione PDF annullata".to_string())?;
+    let dest = handle.path().to_path_buf();
+
+    let preferred = user_facing_pdf_path(&source_pdf);
+    let src = if preferred.exists() { preferred } else { source_pdf };
+
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let bytes =
+            std::fs::read(&src).map_err(|e| format!("Impossibile leggere il PDF: {e}"))?;
+        crate::document::write_file_atomic_sync(&dest, &bytes)
+            .map_err(|e| format!("Errore salvataggio PDF: {e}"))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Errore worker salvataggio PDF: {e}"))??;
+
+    Ok(handle.path().to_path_buf())
 }
 
 pub async fn clean_build_dir(tex_path: PathBuf) -> Result<String, String> {

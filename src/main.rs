@@ -26,11 +26,12 @@ use project::{
     BibEntry, CompletionContext, FolderSearchHit, LabelEntry, OutlineFilter, OutlineItem,
     SearchOptions, SuggestionItem, TextMatch,
 };
-use quality::{LintWarning, SpellCheckOutcome, WordCountStats};
+use quality::{LintWarning, SpellCheckOutcome, UpdateInfo, WordCountStats};
 use recipes::{RecipeConfig, RecipeStep};
 use settings::UserSettings;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use symbols::{FormulaItem, PaletteTab, MATH_LIBRARIES};
 
 /// Maximum number of decoded PDF pages retained in memory & GPU atlas at once.
@@ -83,6 +84,7 @@ pub struct TabState {
     pub id: u64,
     pub doc: Document,
     pub compile_log: String,
+    pub compile_log_content: text_editor::Content,
     pub diagnostics: Vec<CompileDiagnostic>,
     pub error_lines: HashSet<usize>, // 0-based line indices
     pub sync_highlight_line: Option<usize>, // 0-based line highlighted after reverse sync
@@ -102,14 +104,18 @@ pub struct TabState {
     pub word_count: Option<WordCountStats>,
     pub lint_warnings: Vec<LintWarning>,
     pub spell_outcome: Option<SpellCheckOutcome>,
+    pub misspelled_words: Arc<HashSet<String>>,
 }
 
 impl TabState {
     fn new(id: u64) -> Self {
+        let initial_log = "Premi Compila (o Ctrl+B) per eseguire pdflatex.".to_string();
+        let compile_log_content = text_editor::Content::with_text(&initial_log);
         Self {
             id,
             doc: Document::default(),
-            compile_log: "Premi Compila (o Ctrl+B) per eseguire pdflatex.".to_string(),
+            compile_log: initial_log,
+            compile_log_content,
             diagnostics: Vec::new(),
             error_lines: HashSet::new(),
             sync_highlight_line: None,
@@ -129,6 +135,7 @@ impl TabState {
             word_count: None,
             lint_warnings: Vec::new(),
             spell_outcome: None,
+            misspelled_words: Arc::new(HashSet::new()),
         }
     }
 
@@ -240,6 +247,9 @@ pub struct App {
     pub match_strokes: Vec<Vec<Point>>,
     pub match_results: Vec<MatchCandidate>,
     internal_clipboard: Option<String>,
+    pub available_update: Option<UpdateInfo>,
+    spell_rev: u64,
+    spell_unavailable_lang: Option<String>,
 }
 
 impl Default for App {
@@ -339,6 +349,9 @@ impl Default for App {
             match_strokes: Vec::new(),
             match_results: Vec::new(),
             internal_clipboard: None,
+            available_update: None,
+            spell_rev: 0,
+            spell_unavailable_lang: None,
         }
     }
 }
@@ -497,6 +510,15 @@ pub enum Message {
     CompileFinished(u64, Result<CompileResult, String>),
     CleanBuild,
     BuildCleaned(u64, Result<String, String>),
+    UpdateCheckFinished(Option<UpdateInfo>),
+    OpenUpdateUrl,
+    DismissUpdateBanner,
+    SavePdfAs,
+    PdfExported(Result<PathBuf, String>),
+    AutoSpellcheckFinished(u64, u64, String, SpellCheckOutcome),
+    CopyText(String),
+    LogViewerAction(text_editor::Action),
+    CopyLogSelection,
 }
 
 fn write_wl_clipboard_bg(text: String) {
@@ -594,11 +616,13 @@ impl App {
             compiler::detect_installed_packages(),
             Message::InstalledPackagesDetected,
         );
+        let check_update =
+            Task::perform(quality::check_for_update(), Message::UpdateCheckFinished);
         let detect_scale = window::get_oldest().then(|opt| match opt {
             Some(id) => window::get_scale_factor(id).map(Message::ScaleFactorDetected),
             None => Task::none(),
         });
-        (app, Task::batch([detect_pkgs, detect_scale]))
+        (app, Task::batch([detect_pkgs, check_update, detect_scale]))
     }
 
     fn persist_user_settings(&self) {
@@ -707,6 +731,31 @@ impl App {
         } else {
             Theme::Light
         }
+    }
+
+    fn schedule_auto_spellcheck(&mut self, debounce_ms: u64) -> Task<Message> {
+        if self.screen != Screen::Editor {
+            return Task::none();
+        }
+        let lang = self.spell_lang.clone();
+        if self.spell_unavailable_lang.as_deref() == Some(lang.as_str()) {
+            return Task::none();
+        }
+        self.spell_rev = self.spell_rev.wrapping_add(1);
+        let rev = self.spell_rev;
+        let tab = self.tab();
+        let tab_id = tab.id;
+        let source = tab.doc.text();
+        Task::perform(
+            async move {
+                if debounce_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)).await;
+                }
+                let out = quality::run_hunspell(source, lang.clone()).await;
+                (lang, out)
+            },
+            move |(lang_res, out)| Message::AutoSpellcheckFinished(tab_id, rev, lang_res, out),
+        )
     }
 
     fn reset_gpu_pdf_cache(&mut self) {
@@ -1041,6 +1090,7 @@ impl App {
         let is_active = idx == self.active_tab;
         let tab = &mut self.tabs[idx];
         tab.compile_log = result.log;
+        tab.compile_log_content = text_editor::Content::with_text(&tab.compile_log);
         tab.last_compile_ok = Some(result.success);
 
         if result.success {
@@ -1159,6 +1209,7 @@ impl App {
         let mut tasks = vec![
             scrollable::scroll_to(self.editor_scroll_id.clone(), editor_off),
             self.spawn_word_count_task(),
+            self.schedule_auto_spellcheck(150),
         ];
         if self.show_pdf && has_pdf {
             tasks.push(scrollable::scroll_to(self.pdf_scroll_id.clone(), pdf_off));
@@ -2214,17 +2265,19 @@ impl App {
             }
             Message::SetSpellLang(lang) => {
                 self.spell_lang = lang;
+                self.spell_unavailable_lang = None;
                 self.persist_user_settings();
                 if self.show_log && self.log_tab == LogTab::Spellcheck {
                     return self.update(Message::RunSpellcheck);
                 }
-                Task::none()
+                self.schedule_auto_spellcheck(0)
             }
             Message::RunSpellcheck => {
                 if self.is_spellchecking {
                     return Task::none();
                 }
                 self.is_spellchecking = true;
+                self.spell_unavailable_lang = None;
                 self.show_log = true;
                 self.show_pdf = false;
                 self.log_tab = LogTab::Spellcheck;
@@ -2241,6 +2294,11 @@ impl App {
                 if let Some(idx) = self.find_tab_by_id(tab_id) {
                     match &outcome {
                         SpellCheckOutcome::Ok(list) => {
+                            let words: HashSet<String> =
+                                list.iter().map(|i| i.word.clone()).collect();
+                            self.tabs[idx].misspelled_words = Arc::new(words);
+                            self.tabs[idx].doc.highlight_revision =
+                                self.tabs[idx].doc.highlight_revision.wrapping_add(1);
                             self.status = if list.is_empty() {
                                 "Controllo ortografico: nessun errore rilevato".to_string()
                             } else {
@@ -2248,9 +2306,15 @@ impl App {
                             };
                         }
                         SpellCheckOutcome::MissingDictionary { lang, .. } => {
+                            self.tabs[idx].misspelled_words = Arc::new(HashSet::new());
+                            self.tabs[idx].doc.highlight_revision =
+                                self.tabs[idx].doc.highlight_revision.wrapping_add(1);
                             self.status = format!("Dizionario hunspell '{lang}' mancante");
                         }
                         SpellCheckOutcome::Error(err) => {
+                            self.tabs[idx].misspelled_words = Arc::new(HashSet::new());
+                            self.tabs[idx].doc.highlight_revision =
+                                self.tabs[idx].doc.highlight_revision.wrapping_add(1);
                             self.status = err.clone();
                         }
                     }
@@ -2575,7 +2639,8 @@ impl App {
                     self.refresh_suggestions();
                     let scroll_task = self.ensure_cursor_visible();
                     let live_task = self.schedule_live_compile(650, false);
-                    return Task::batch([scroll_task, live_task]);
+                    let spell_task = self.schedule_auto_spellcheck(900);
+                    return Task::batch([scroll_task, live_task, spell_task]);
                 }
                 Task::none()
             }
@@ -2590,7 +2655,8 @@ impl App {
                     self.refresh_suggestions();
                     let scroll_task = self.ensure_cursor_visible();
                     let live_task = self.schedule_live_compile(650, false);
-                    return Task::batch([scroll_task, live_task]);
+                    let spell_task = self.schedule_auto_spellcheck(900);
+                    return Task::batch([scroll_task, live_task, spell_task]);
                 }
                 Task::none()
             }
@@ -3023,7 +3089,8 @@ impl App {
                     self.refresh_suggestions();
                     let scroll_task = self.ensure_cursor_visible();
                     let live_task = self.schedule_live_compile(650, false);
-                    return Task::batch([scroll_task, live_task]);
+                    let spell_task = self.schedule_auto_spellcheck(900);
+                    return Task::batch([scroll_task, live_task, spell_task]);
                 }
                 Task::none()
             }
@@ -3046,7 +3113,8 @@ impl App {
                     self.refresh_suggestions();
                     let scroll_task = self.ensure_cursor_visible();
                     let live_task = self.schedule_live_compile(650, false);
-                    return Task::batch([scroll_task, live_task]);
+                    let spell_task = self.schedule_auto_spellcheck(900);
+                    return Task::batch([scroll_task, live_task, spell_task]);
                 }
                 Task::none()
             }
@@ -3116,7 +3184,8 @@ impl App {
                         let _ = self.refresh_find_state(false);
                     }
                     let live_task = self.schedule_live_compile(650, false);
-                    Task::batch([scroll_task, live_task])
+                    let spell_task = self.schedule_auto_spellcheck(900);
+                    Task::batch([scroll_task, live_task, spell_task])
                 } else {
                     scroll_task
                 }
@@ -3189,7 +3258,8 @@ impl App {
                     self.refresh_suggestions();
                     let scroll_task = self.ensure_cursor_visible();
                     let live_task = self.schedule_live_compile(650, false);
-                    return Task::batch([scroll_task, live_task]);
+                    let spell_task = self.schedule_auto_spellcheck(900);
+                    return Task::batch([scroll_task, live_task, spell_task]);
                 }
                 Task::none()
             }
@@ -3202,7 +3272,8 @@ impl App {
                     self.status = "Annullato".to_string();
                     let scroll_task = self.ensure_cursor_visible();
                     let live_task = self.schedule_live_compile(650, false);
-                    return Task::batch([scroll_task, live_task]);
+                    let spell_task = self.schedule_auto_spellcheck(900);
+                    return Task::batch([scroll_task, live_task, spell_task]);
                 }
                 Task::none()
             }
@@ -3215,7 +3286,8 @@ impl App {
                     self.status = "Ripristinato".to_string();
                     let scroll_task = self.ensure_cursor_visible();
                     let live_task = self.schedule_live_compile(650, false);
-                    return Task::batch([scroll_task, live_task]);
+                    let spell_task = self.schedule_auto_spellcheck(900);
+                    return Task::batch([scroll_task, live_task, spell_task]);
                 }
                 Task::none()
             }
@@ -3539,6 +3611,7 @@ impl App {
                     tab.error_lines.clear();
                     tab.show_raw_log = true;
                     tab.compile_log = err;
+                    tab.compile_log_content = text_editor::Content::with_text(&tab.compile_log);
                     if idx == self.active_tab {
                         self.show_pdf = false;
                         self.show_log = true;
@@ -3572,6 +3645,109 @@ impl App {
             }
             Message::BuildCleaned(_, Err(err)) => {
                 self.status = err;
+                Task::none()
+            }
+            Message::UpdateCheckFinished(info) => {
+                self.available_update = info;
+                Task::none()
+            }
+            Message::OpenUpdateUrl => {
+                if let Some(upd) = &self.available_update {
+                    compiler::open_url_external(&upd.url);
+                }
+                Task::none()
+            }
+            Message::DismissUpdateBanner => {
+                self.available_update = None;
+                Task::none()
+            }
+            Message::SavePdfAs => {
+                let Some(pdf_path) = self.tab().last_pdf.clone() else {
+                    self.status = "Nessun PDF compilato da salvare".to_string();
+                    return Task::none();
+                };
+                let default_name = pdf_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("documento.pdf")
+                    .to_string();
+                let default_dir = self
+                    .tab()
+                    .doc
+                    .path
+                    .as_deref()
+                    .and_then(|p| p.parent())
+                    .map(Path::to_path_buf);
+                Task::perform(
+                    compiler::export_pdf_as(pdf_path, default_name, default_dir),
+                    Message::PdfExported,
+                )
+            }
+            Message::PdfExported(Ok(dest)) => {
+                let name = dest
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("PDF");
+                self.status = format!("PDF salvato: {name}");
+                Task::none()
+            }
+            Message::PdfExported(Err(err)) => {
+                self.status = err;
+                Task::none()
+            }
+            Message::AutoSpellcheckFinished(tab_id, rev, lang, outcome) => {
+                if rev != self.spell_rev {
+                    return Task::none();
+                }
+                if let Some(idx) = self.find_tab_by_id(tab_id) {
+                    match &outcome {
+                        SpellCheckOutcome::Ok(list) => {
+                            let words: HashSet<String> =
+                                list.iter().map(|i| i.word.clone()).collect();
+                            self.tabs[idx].misspelled_words = Arc::new(words);
+                            self.tabs[idx].doc.highlight_revision =
+                                self.tabs[idx].doc.highlight_revision.wrapping_add(1);
+                        }
+                        SpellCheckOutcome::MissingDictionary { .. }
+                        | SpellCheckOutcome::Error(_) => {
+                            self.spell_unavailable_lang = Some(lang);
+                            self.tabs[idx].misspelled_words = Arc::new(HashSet::new());
+                            self.tabs[idx].doc.highlight_revision =
+                                self.tabs[idx].doc.highlight_revision.wrapping_add(1);
+                        }
+                    }
+                    self.tabs[idx].spell_outcome = Some(outcome);
+                }
+                Task::none()
+            }
+            Message::CopyText(text) => {
+                if !text.is_empty() {
+                    self.internal_clipboard = Some(text.clone());
+                    write_wl_clipboard_bg(text.clone());
+                    self.status = "Copiato negli appunti".to_string();
+                    return clipboard::write(text);
+                }
+                Task::none()
+            }
+            Message::LogViewerAction(action) => {
+                if !matches!(action, text_editor::Action::Edit(_)) {
+                    self.tab_mut().compile_log_content.perform(action);
+                }
+                Task::none()
+            }
+            Message::CopyLogSelection => {
+                let selected = self
+                    .tab()
+                    .compile_log_content
+                    .selection()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| self.tab().compile_log.clone());
+                if !selected.is_empty() {
+                    self.internal_clipboard = Some(selected.clone());
+                    write_wl_clipboard_bg(selected.clone());
+                    self.status = "Log copiato negli appunti".to_string();
+                    return clipboard::write(selected);
+                }
                 Task::none()
             }
         }

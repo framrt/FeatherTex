@@ -48,6 +48,7 @@ pub struct Document {
     pub path: Option<PathBuf>,
     pub content: text_editor::Content,
     pub is_dirty: bool,
+    pub highlight_revision: u64,
     cached_max_line_cols: usize,
     cached_packages: HashSet<String>,
     undo_stack: Vec<UndoSnapshot>,
@@ -63,6 +64,7 @@ impl Default for Document {
             path: None,
             content,
             is_dirty: false,
+            highlight_revision: 0,
             cached_max_line_cols: 0,
             cached_packages: HashSet::new(),
             undo_stack: Vec::new(),
@@ -178,6 +180,7 @@ impl Document {
         }
     }
     fn rebuild_caches(&mut self) {
+        self.highlight_revision = self.highlight_revision.wrapping_add(1);
         let mut max_cols = 0usize;
         let mut packages = HashSet::new();
 
@@ -232,10 +235,13 @@ impl Document {
         let (edited_line, _) = self.content.cursor_position();
         let is_paste = matches!(action, text_editor::Action::Edit(text_editor::Edit::Paste(_)));
 
-        // Always allow inserting a literal `\t` character (working around cosmic-text 0.12
-        // stripping a trailing control char inside `insert_at`).
+        // Convert literal Tab key presses into 4 spaces consistently across the editor.
         if matches!(action, text_editor::Action::Edit(text_editor::Edit::Insert('\t'))) {
-            self.paste_preserving_tabs("\t");
+            self.content
+                .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+                    Arc::new("    ".to_string()),
+                )));
+            self.highlight_revision = self.highlight_revision.wrapping_add(1);
             self.refresh_cache_after_edit(prev_lines, edited_line);
             return;
         }
@@ -558,6 +564,7 @@ impl Document {
             }
         }
         self.is_dirty = true;
+        self.highlight_revision = self.highlight_revision.wrapping_add(1);
         if snippet.contains('\n') || snippet.contains("\\usepackage") {
             self.rebuild_caches();
         } else {
@@ -1011,24 +1018,21 @@ impl Document {
                     if idx == orig_line {
                         single_col_delta = -1;
                     }
-                } else if line.starts_with("  ") {
-                    line.replace_range(0..2, "");
-                    changed += 1;
-                    if idx == orig_line {
-                        single_col_delta = -2;
-                    }
-                } else if line.starts_with(' ') {
-                    line.remove(0);
-                    changed += 1;
-                    if idx == orig_line {
-                        single_col_delta = -1;
+                } else {
+                    let spaces = line.bytes().take(4).take_while(|&b| b == b' ').count();
+                    if spaces > 0 {
+                        line.replace_range(0..spaces, "");
+                        changed += 1;
+                        if idx == orig_line {
+                            single_col_delta = -(spaces as isize);
+                        }
                     }
                 }
             } else if !line.is_empty() || start_l == end_l {
-                line.insert_str(0, "  ");
+                line.insert_str(0, "    ");
                 changed += 1;
                 if idx == orig_line {
-                    single_col_delta = 2;
+                    single_col_delta = 4;
                 }
             }
         }
@@ -1159,12 +1163,12 @@ impl Document {
     }
 }
 
-/// Visual column count matching cosmic-text's default 8-column tab stops.
+/// Visual column count using 4-column tab stops.
 fn visual_line_width(s: &str) -> usize {
     let mut cols = 0usize;
     for ch in s.chars() {
         if ch == '\t' {
-            cols += 8 - (cols % 8);
+            cols += 4 - (cols % 4);
         } else {
             cols += 1;
         }
@@ -1542,6 +1546,7 @@ mod tests {
             path: None,
             content: text_editor::Content::with_text(text),
             is_dirty: false,
+            highlight_revision: 0,
             cached_max_line_cols: 0,
             cached_packages: HashSet::new(),
             undo_stack: Vec::new(),
@@ -1588,8 +1593,8 @@ mod tests {
             true,
         );
         type_str(&mut doc, "x\ny");
-        assert_eq!(doc.text().trim_end_matches('\n'), "\tx\n\ty");
-        assert_eq!(doc.cursor_visual_col(), 9);
+        assert_eq!(doc.text().trim_end_matches('\n'), "    x\n    y");
+        assert_eq!(doc.cursor_visual_col(), 5);
     }
 
     #[test]
@@ -1702,12 +1707,12 @@ mod tests {
             "prima riga\n  seconda riga\nterza riga"
         );
 
-        // Select lines 1..=2 and block-indent, then block-unindent
+        // Select lines 1..=2 and block-indent (4 spaces), then block-unindent
         doc.select_lines_inclusive(0, 1);
         doc.indent_lines(false);
         assert_eq!(
             doc.text().trim_end_matches('\n'),
-            "  prima riga\n    seconda riga\nterza riga"
+            "    prima riga\n      seconda riga\nterza riga"
         );
         doc.indent_lines(true);
         assert_eq!(

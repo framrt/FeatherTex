@@ -830,6 +830,92 @@ pub async fn pick_old_tex_and_latexdiff(current_tex_path: PathBuf) -> Result<Pat
     generate_latexdiff_tex(handle.path(), &current_tex_path).await
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateInfo {
+    pub version: String,
+    pub url: String,
+}
+
+fn parse_semver_tuple(raw: &str) -> Option<(u32, u32, u32)> {
+    let clean = raw.trim().trim_start_matches(['v', 'V']);
+    let core = clean.split(['-', '+']).next().unwrap_or(clean);
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts.next().unwrap_or("0").parse::<u32>().ok()?;
+    let patch = parts.next().unwrap_or("0").parse::<u32>().ok()?;
+    Some((major, minor, patch))
+}
+
+pub fn is_newer_version(latest: &str, current: &str) -> bool {
+    match (parse_semver_tuple(latest), parse_semver_tuple(current)) {
+        (Some(l), Some(c)) => l > c,
+        _ => false,
+    }
+}
+
+fn extract_json_string_field(json: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let pos = json.find(&needle)?;
+    let after = &json[pos + needle.len()..];
+    let colon = after.find(':')?;
+    let rest = after[colon + 1..].trim_start();
+    let inner = rest.strip_prefix('"')?;
+    let mut out = String::new();
+    let mut escaped = false;
+    for ch in inner.chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return Some(out);
+        } else {
+            out.push(ch);
+        }
+    }
+    None
+}
+
+pub async fn check_for_update() -> Option<UpdateInfo> {
+    let out = Command::new("curl")
+        .kill_on_drop(true)
+        .args([
+            "-sSL",
+            "--fail",
+            "--max-time",
+            "6",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-H",
+            "User-Agent: FeatherTex",
+            "--",
+            "https://api.github.com/repos/framrt/FeatherTex/releases/latest",
+        ])
+        .output()
+        .await
+        .ok()?;
+
+    if !out.status.success() {
+        return None;
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+    let tag = extract_json_string_field(&body, "tag_name")?;
+    let version = tag.trim().trim_start_matches(['v', 'V']).to_string();
+    if !is_newer_version(&version, env!("CARGO_PKG_VERSION")) {
+        return None;
+    }
+    let url = extract_json_string_field(&body, "html_url")
+        .filter(|u| u.starts_with("https://github.com/"))
+        .unwrap_or_else(|| "https://github.com/framrt/FeatherTex/releases/latest".to_string());
+
+    Some(UpdateInfo { version, url })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -902,6 +988,21 @@ Un'ipotesi fondamentale. % commento ignoratoxyz
             assert!(diff_txt.contains("DIFadd") || diff_txt.contains("migliorata"));
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn parses_github_release_version_comparison() {
+        assert!(is_newer_version("v0.2.0", "0.1.2"));
+        assert!(is_newer_version("0.1.3", "0.1.2"));
+        assert!(!is_newer_version("v0.1.2", "0.1.2"));
+        assert!(!is_newer_version("v0.1.1", "0.1.2"));
+
+        let sample = r#"{"tag_name": "v0.2.0", "html_url": "https://github.com/framrt/FeatherTex/releases/tag/v0.2.0"}"#;
+        assert_eq!(extract_json_string_field(sample, "tag_name").as_deref(), Some("v0.2.0"));
+        assert_eq!(
+            extract_json_string_field(sample, "html_url").as_deref(),
+            Some("https://github.com/framrt/FeatherTex/releases/tag/v0.2.0")
+        );
     }
 }
 
