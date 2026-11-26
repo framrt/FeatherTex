@@ -215,12 +215,24 @@ const AUX_EXTENSIONS: &[&str] = &["aux", "toc", "out", "lof", "lot", "nav", "snm
 
 /// Returns a RAM-disk live build directory in `/dev/shm` when available (eliminating disk I/O
 /// while typing), falling back to `<project>/.build/live` otherwise.
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    extern "C" {
+        fn getuid() -> u32;
+    }
+    unsafe { getuid() }
+}
+
 fn live_dir_for(parent_dir: &Path) -> PathBuf {
     let shm = Path::new("/dev/shm");
     if shm.is_dir() {
         let canon = std::fs::canonicalize(parent_dir).unwrap_or_else(|_| parent_dir.to_path_buf());
         let hash = fnv1a_64(canon.to_string_lossy().as_bytes());
-        shm.join(format!("feathertex_live_{hash:016x}"))
+        #[cfg(unix)]
+        let name = format!("feathertex_live_{}_{hash:016x}", current_uid());
+        #[cfg(not(unix))]
+        let name = format!("feathertex_live_{hash:016x}");
+        shm.join(name)
     } else {
         parent_dir.join(".build").join("live")
     }
@@ -2248,8 +2260,8 @@ pub fn open_pdf_external(pdf_path: &Path) {
     let _ = std::process::Command::new("open").arg(pdf_path).spawn();
 
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd")
-        .args(["/C", "start", ""])
+    let _ = std::process::Command::new("rundll32.exe")
+        .arg("url.dll,FileProtocolHandler")
         .arg(pdf_path)
         .spawn();
 }
@@ -2259,6 +2271,13 @@ pub async fn clean_build_dir(tex_path: PathBuf) -> Result<String, String> {
         .parent()
         .ok_or_else(|| "Cartella del file non trovata".to_string())?;
     let build_dir = parent_dir.join(".build");
+
+    if build_dir.is_symlink() {
+        return Err(
+            "La cartella .build è un collegamento simbolico: pulizia annullata per sicurezza."
+                .to_string(),
+        );
+    }
 
     if build_dir.exists() {
         tokio::fs::remove_dir_all(&build_dir)

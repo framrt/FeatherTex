@@ -1479,6 +1479,39 @@ pub async fn pick_and_read_file() -> Result<(PathBuf, String), String> {
     read_file(handle.path().to_path_buf()).await
 }
 
+pub fn write_file_atomic_sync(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("feathertex");
+    let tmp_path = path.with_file_name(format!(".{file_name}.feathertex_tmp_{pid}_{seq}"));
+
+    let write_res = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp_path)?;
+        f.write_all(contents)?;
+        f.flush()?;
+        let _ = f.sync_all();
+        Ok(())
+    })();
+
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    Ok(())
+}
+
 pub async fn save_file(path: Option<PathBuf>, contents: String) -> Result<PathBuf, String> {
     let target_path = match path {
         Some(p) => p,
@@ -1491,8 +1524,10 @@ pub async fn save_file(path: Option<PathBuf>, contents: String) -> Result<PathBu
             .ok_or_else(|| "Salvataggio annullato".to_string())?,
     };
 
-    tokio::fs::write(&target_path, contents)
+    let write_path = target_path.clone();
+    tokio::task::spawn_blocking(move || write_file_atomic_sync(&write_path, contents.as_bytes()))
         .await
+        .map_err(|e| format!("Errore worker salvataggio: {e}"))?
         .map_err(|e| format!("Errore scrittura file: {e}"))?;
 
     Ok(target_path)

@@ -1855,12 +1855,37 @@ pub fn prepare_figure_snippet(
                 let file_name = image_path
                     .file_name()
                     .ok_or_else(|| "Nome immagine non valido".to_string())?;
-                let dest = figs_dir.join(file_name);
-                if !dest.exists() || !paths_equivalent(image_path, &dest) {
-                    std::fs::copy(image_path, &dest)
+                let initial_dest = figs_dir.join(file_name);
+                let final_dest =
+                    if !initial_dest.exists() || paths_equivalent(image_path, &initial_dest) {
+                        initial_dest
+                    } else {
+                        let mut chosen = None;
+                        for idx in 1..=9999u32 {
+                            let candidate_name = if ext.is_empty() {
+                                format!("{stem}_{idx}")
+                            } else {
+                                format!("{stem}_{idx}.{ext}")
+                            };
+                            let candidate = figs_dir.join(&candidate_name);
+                            if !candidate.exists() {
+                                chosen = Some(candidate);
+                                break;
+                            }
+                        }
+                        chosen.ok_or_else(|| {
+                            "Impossibile trovare un nome univoco nella cartella figures/".to_string()
+                        })?
+                    };
+                if !final_dest.exists() || !paths_equivalent(image_path, &final_dest) {
+                    std::fs::copy(image_path, &final_dest)
                         .map_err(|e| format!("Errore copia immagine in figures/: {e}"))?;
                 }
-                format!("figures/{}", file_name.to_string_lossy())
+                let final_name = final_dest
+                    .file_name()
+                    .unwrap_or(file_name)
+                    .to_string_lossy();
+                format!("figures/{final_name}")
             }
         } else {
             image_path.to_string_lossy().replace('\\', "/")
@@ -1991,7 +2016,11 @@ pub enum BibIdentifier {
 
 pub fn classify_bib_identifier(raw: &str) -> Option<BibIdentifier> {
     let trimmed = raw.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty()
+        || trimmed
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+    {
         return None;
     }
 
@@ -2060,19 +2089,28 @@ pub async fn fetch_bibtex_entry(raw_input: String) -> Result<(String, BibEntry),
     })?;
 
     let mut cmd = tokio::process::Command::new("curl");
-    cmd.kill_on_drop(true)
-        .args(["-sSL", "--fail", "--max-time", "12"]);
+    cmd.kill_on_drop(true).args([
+        "-sSL",
+        "--fail",
+        "--max-time",
+        "12",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+    ]);
 
     match &ident {
         BibIdentifier::Doi(doi) => {
             cmd.args([
                 "-H",
                 "Accept: application/x-bibtex; charset=utf-8",
+                "--",
                 &format!("https://doi.org/{doi}"),
             ]);
         }
         BibIdentifier::Arxiv(arxiv_id) => {
-            cmd.arg(format!("https://arxiv.org/bibtex/{arxiv_id}"));
+            cmd.args(["--", &format!("https://arxiv.org/bibtex/{arxiv_id}")]);
         }
     }
 
@@ -2124,12 +2162,17 @@ pub fn append_bibtex_to_project(
                     } else {
                         PathBuf::from(format!("{t}.bib"))
                     };
-                    target_bib = Some(if p.is_absolute() {
-                        p
-                    } else {
-                        project_dir.join(p)
-                    });
-                    break;
+                    let escapes_project = p.is_absolute()
+                        || p.components().any(|c| {
+                            matches!(
+                                c,
+                                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+                            )
+                        });
+                    if !escapes_project {
+                        target_bib = Some(project_dir.join(p));
+                        break;
+                    }
                 }
             }
         }
@@ -2178,7 +2221,7 @@ pub fn append_bibtex_to_project(
     updated.push_str(bibtex_text.trim());
     updated.push('\n');
 
-    std::fs::write(&bib_path, updated)
+    crate::document::write_file_atomic_sync(&bib_path, updated.as_bytes())
         .map_err(|e| format!("Errore salvataggio file .bib: {e}"))?;
     Ok((bib_path, true))
 }
@@ -2330,6 +2373,51 @@ mod tests {
             classify_bib_identifier("arXiv:1706.03762v5"),
             Some(BibIdentifier::Arxiv("1706.03762v5".to_string()))
         );
+        assert_eq!(
+            classify_bib_identifier("10.1145/3581784 --upload-file /etc/passwd"),
+            None
+        );
+    }
+
+    #[test]
+    fn figure_copy_avoids_overwrite_and_bib_stays_within_project() {
+        let dir = std::env::temp_dir().join("feathertex_safety_guards_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let proj = dir.join("proj");
+        let figs = proj.join("figures");
+        let ext_dir = dir.join("external");
+        std::fs::create_dir_all(&figs).unwrap();
+        std::fs::create_dir_all(&ext_dir).unwrap();
+
+        let tex_path = proj.join("main.tex");
+        std::fs::write(&tex_path, "\\documentclass{article}\n").unwrap();
+
+        // Existing figure in figures/plot.png must NOT be overwritten by external plot.png
+        let existing_fig = figs.join("plot.png");
+        let new_fig = ext_dir.join("plot.png");
+        std::fs::write(&existing_fig, b"EXISTING_PNG").unwrap();
+        std::fs::write(&new_fig, b"NEW_PNG").unwrap();
+
+        let (snippet, pkg) =
+            prepare_figure_snippet(&new_fig, Some(&tex_path), 0.8).expect("figure snippet");
+        assert_eq!(pkg, "graphicx");
+        assert!(snippet.contains("figures/plot_1.png"), "got: {snippet}");
+        assert_eq!(std::fs::read(&existing_fig).unwrap(), b"EXISTING_PNG");
+        assert_eq!(std::fs::read(figs.join("plot_1.png")).unwrap(), b"NEW_PNG");
+
+        // Parent-traversal \addbibresource must be ignored and fall back inside project dir
+        let (bib_path, added) = append_bibtex_to_project(
+            &proj,
+            "\\addbibresource{../outside.bib}\n",
+            "@article{k2026,\n  title={Safe}\n}\n",
+            "k2026",
+        )
+        .expect("append bib");
+        assert!(added);
+        assert_eq!(bib_path, proj.join("references.bib"));
+        assert!(!dir.join("outside.bib").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

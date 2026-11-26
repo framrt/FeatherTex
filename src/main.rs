@@ -1177,14 +1177,16 @@ impl App {
                 continue;
             }
             if let Some(path) = tab.doc.path.clone() {
-                if std::fs::write(&path, tab.doc.text()).is_ok() {
+                if document::write_file_atomic_sync(&path, tab.doc.text().as_bytes()).is_ok() {
                     tab.doc.is_dirty = false;
                     saved += 1;
                 }
             } else if let Some(dir) = recent::autosave_dir() {
                 if std::fs::create_dir_all(&dir).is_ok() {
                     let autosave_path = dir.join(format!("senza_titolo_{}.tex", tab.id));
-                    if std::fs::write(&autosave_path, tab.doc.text()).is_ok() {
+                    if document::write_file_atomic_sync(&autosave_path, tab.doc.text().as_bytes())
+                        .is_ok()
+                    {
                         tab.doc.path = Some(autosave_path.clone());
                         tab.doc.is_dirty = false;
                         recent::record_recent(&mut self.recent_files, autosave_path);
@@ -1771,7 +1773,10 @@ impl App {
                 // Auto-save named dirty file before closing its tab so edits are never lost.
                 if self.tabs[index].doc.is_dirty {
                     if let Some(path) = self.tabs[index].doc.path.clone() {
-                        let _ = std::fs::write(&path, self.tabs[index].doc.text());
+                        let _ = document::write_file_atomic_sync(
+                            &path,
+                            self.tabs[index].doc.text().as_bytes(),
+                        );
                         self.tabs[index].doc.is_dirty = false;
                     }
                 }
@@ -2266,7 +2271,8 @@ impl App {
                 };
                 if self.tab().doc.is_dirty {
                     if let Some(p) = self.tab().doc.path.as_ref() {
-                        let _ = std::fs::write(p, self.tab().doc.text());
+                        let _ =
+                            document::write_file_atomic_sync(p, self.tab().doc.text().as_bytes());
                         self.tab_mut().doc.is_dirty = false;
                     }
                 }
@@ -2291,7 +2297,8 @@ impl App {
                 };
                 if self.tab().doc.is_dirty {
                     if let Some(p) = self.tab().doc.path.as_ref() {
-                        let _ = std::fs::write(p, self.tab().doc.text());
+                        let _ =
+                            document::write_file_atomic_sync(p, self.tab().doc.text().as_bytes());
                         self.tab_mut().doc.is_dirty = false;
                     }
                 }
@@ -3417,7 +3424,10 @@ impl App {
                             .as_ref()
                             .is_some_and(|s| s.text_hash == current_hash);
                         if has_matching_staged {
-                            if let Err(e) = std::fs::write(&existing_path, &contents) {
+                            if let Err(e) = document::write_file_atomic_sync(
+                                &existing_path,
+                                contents.as_bytes(),
+                            ) {
                                 self.status = format!("Errore scrittura file: {e}");
                                 return Task::none();
                             }
@@ -3443,7 +3453,10 @@ impl App {
                         if self.is_live_compiling
                             && self.live_in_flight_hash == Some((tab_id, current_hash))
                         {
-                            if let Err(e) = std::fs::write(&existing_path, &contents) {
+                            if let Err(e) = document::write_file_atomic_sync(
+                                &existing_path,
+                                contents.as_bytes(),
+                            ) {
                                 self.status = format!("Errore scrittura file: {e}");
                                 return Task::none();
                             }
