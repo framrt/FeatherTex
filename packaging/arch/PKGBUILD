@@ -4,7 +4,7 @@ pkgver=0.1.0
 pkgrel=1
 pkgdesc="Editor LaTeX leggero e moderno in Rust/Iced con anteprima PDF Poppler+Cairo, ricette, Outline e controllo qualità"
 arch=('x86_64')
-url="https://example.invalid/feathertex"
+url="https://github.com/framrt/FeatherTex"
 license=('GPL-3.0-or-later')
 depends=(
   'poppler-glib'
