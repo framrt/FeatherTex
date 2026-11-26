@@ -1,0 +1,26 @@
+[package]
+name = "feathertex"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+iced = { version = "0.13", features = ["tokio", "advanced", "image", "web-colors"] }
+rfd = "0.15"
+tokio = { version = "1", features = ["fs", "process", "rt", "time"] }
+
+# Keep dev builds snappy and avoid multi-GB DWARF debug info bloat across 300+ GPU/GUI crates.
+[profile.dev]
+opt-level = 2
+debug = 0
+
+[profile.dev.package."*"]
+opt-level = 3
+debug = 0
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

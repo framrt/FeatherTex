@@ -1,0 +1,73 @@
+name: Release FeatherTex (Linux .deb, Arch PKGBUILD, Windows .zip)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-deb:
+    name: Build Debian/Mint .deb (x86_64)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Poppler & GTK build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libpoppler-glib-dev \
+            libcairo2-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libxdo-dev \
+            dpkg
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Package .deb
+        run: |
+          chmod +x packaging/debian/build-deb.sh
+          bash packaging/debian/build-deb.sh "${GITHUB_REF_NAME#v}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: feathertex-deb
+          path: dist/*.deb
+
+  build-windows:
+    name: Build Windows x86_64 (.exe + demo zip)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build & Package Windows ZIP
+        shell: pwsh
+        run: |
+          ./packaging/windows/build-windows.ps1 -Version "${{ github.ref_name }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: feathertex-windows
+          path: dist/*.zip
+
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-deb, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/feathertex-deb/*.deb
+            artifacts/feathertex-windows/*.zip
+            packaging/arch/PKGBUILD
+

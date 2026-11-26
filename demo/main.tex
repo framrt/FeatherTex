@@ -1,0 +1,35 @@
+\documentclass[a4paper,11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage[numbers]{natbib}
+
+\newtheorem{theorem}{Teorema}
+\newtheorem{lemma}{Lemma}
+\newtheorem{definition}{Definizione}
+
+\title{FeatherTex Demo: Articolo Scientifico Multi-File}
+\author{Autore Demo}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Questo progetto dimostrativo mostra le funzionalità di \textbf{FeatherTex} per ricercatori:
+struttura multi-file con \texttt{\textbackslash input}, autocompletamento di \texttt{\textbackslash cite} e
+\texttt{\textbackslash cref}, tabelle \texttt{booktabs}, bibliografia BibTeX automatica,
+conteggio parole e linter tipografico.
+\end{abstract}
+
+\input{chapters/intro}
+\input{chapters/results}
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}
+

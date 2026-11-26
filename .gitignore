@@ -1,0 +1,22 @@
+# Build Rust
+/target/
+/feathertex
+/feathertex.new
+/dist/
+
+.build/
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.fmt
+*.log
+*.out
+*.pdf
+*.synctex.gz
+*.toc
+
+packaging/arch/src/
+packaging/arch/pkg/
+packaging/arch/*.pkg.tar.*

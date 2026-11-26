@@ -1,0 +1,25 @@
+% !TeX root = ../main.tex
+\section{Risultati e Confronto}\label{sec:results}
+
+Dal~\cref{thm:banach} e dalla~\cref{def:completo} segue la convergenza geometrica dell'iterazione:
+\begin{equation}\label{eq:conv}
+  d(x_n, x^*) \le \frac{q^n}{1 - q}\, d(x_1, x_0), \qquad q \in (0, 1).
+\end{equation}
+
+La~\cref{tab:bench} riassume i tempi tipici di compilazione incrementale e rendering~\cite{vaswani2017}.
+
+\begin{table}[htbp]
+  \centering
+  \begin{tabular}{lcc}
+    \toprule
+    \textbf{Fase} & \textbf{Metodo classico} & \textbf{FeatherTex} \\
+    \midrule
+    Preambolo (.fmt) & 0.90 s & 0.12 s \\
+    Rendering PDF (Poppler+Cairo) & 418 ms & 15 ms \\
+    Anteprima pre-compilata & --- & Istantanea \\
+    \bottomrule
+  \end{tabular}
+  \caption{Confronto prestazioni nella pipeline di compilazione.}
+  \label{tab:bench}
+\end{table}
+

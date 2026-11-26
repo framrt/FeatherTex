@@ -1,0 +1,67 @@
+# Maintainer: FeatherTex Contributors
+pkgname=feathertex
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Editor LaTeX leggero e moderno in Rust/Iced con anteprima PDF Poppler+Cairo, ricette, Outline e controllo qualità"
+arch=('x86_64')
+url="https://example.invalid/feathertex"
+license=('GPL-3.0-or-later')
+depends=(
+  'poppler-glib'
+  'cairo'
+  'glib2'
+  'gcc-libs'
+  'hicolor-icon-theme'
+)
+makedepends=(
+  'cargo'
+  'pkgconf'
+)
+optdepends=(
+  'texlive-basic: compilazione pdfLaTeX'
+  'texlive-latexrecommended: pacchetti accademici standard e natbib/booktabs'
+  'texlive-binextra: texcount, chktex, latexdiff, latexmk e synctex'
+  'texlive-mathscience: physics, siunitx, algorithm2e, ebproof'
+  'biber: bibliografia moderna con biblatex'
+  'hunspell: controllo ortografico LaTeX-aware'
+  'hunspell-it: dizionario italiano per hunspell'
+  'hunspell-en_us: dizionario inglese US per hunspell'
+  'poppler: fallback PDF esterno'
+  'wl-clipboard: supporto appunti su Wayland'
+)
+options=('!lto')
+
+# Per una build da sorgenti remoti (AUR/GitHub Release):
+# source=("$pkgname-$pkgver.tar.gz::https://github.com/<USER>/<REPO>/archive/v$pkgver.tar.gz")
+# sha256sums=('SKIP')
+
+_project_root="${startdir}/../.."
+
+build() {
+  cd "$_project_root"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR="$srcdir/target"
+  cargo build --release --locked
+}
+
+package() {
+  install -Dm755 "$srcdir/target/release/feathertex" \
+    "$pkgdir/usr/bin/feathertex"
+
+  install -Dm644 "$_project_root/packaging/linux/feathertex.desktop" \
+    "$pkgdir/usr/share/applications/feathertex.desktop"
+
+  install -Dm644 "$_project_root/packaging/linux/feathertex.svg" \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/feathertex.svg"
+
+  install -dm755 "$pkgdir/usr/share/feathertex/demo/chapters"
+  install -Dm644 "$_project_root/demo/main.tex" \
+    "$pkgdir/usr/share/feathertex/demo/main.tex"
+  install -Dm644 "$_project_root/demo/references.bib" \
+    "$pkgdir/usr/share/feathertex/demo/references.bib"
+  install -Dm644 "$_project_root/demo/chapters/intro.tex" \
+    "$pkgdir/usr/share/feathertex/demo/chapters/intro.tex"
+  install -Dm644 "$_project_root/demo/chapters/results.tex" \
+    "$pkgdir/usr/share/feathertex/demo/chapters/results.tex"
+}
+
