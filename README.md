@@ -140,7 +140,7 @@ cargo test
 cargo build --release --locked
 ```
 
-L'eseguibile compilato si troverà in `target/release/feathertex`. Su Linux, `build.rs` rileva automaticamente `poppler-glib` e `cairo` tramite `pkg-config`; su Windows utilizza il backend basato su `pdftocairo` / `pdftoppm`.
+L'eseguibile compilato si troverà in `target/release/feathertex`. Su Linux non è richiesta alcuna libreria di sviluppo Poppler/Cairo a compile-time: `libpoppler-glib` e `libcairo` vengono caricate dinamicamente a runtime se presenti (altrimenti viene usato `pdftocairo`/`pdftoppm` come fallback); su Windows utilizza direttamente il backend basato su `pdftocairo` / `pdftoppm`.
 
 ### Release automatiche (GitHub Actions)
 Il workflow `.github/workflows/release.yml` viene attivato al push di un tag `v*` e genera automaticamente gli artefatti di rilascio:

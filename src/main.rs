@@ -1,7 +1,7 @@
 mod compiler;
 mod document;
 mod matcher;
-#[cfg(has_poppler_glib)]
+#[cfg(target_os = "linux")]
 mod poppler_ffi;
 mod project;
 mod quality;

@@ -14,17 +14,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install Poppler & GTK build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            pkg-config \
-            libpoppler-glib-dev \
-            libcairo2-dev \
-            libglib2.0-dev \
-            libgtk-3-dev \
-            libxdo-dev \
-            dpkg
       - name: Build release binary
         run: cargo build --release --locked
       - name: Package .deb

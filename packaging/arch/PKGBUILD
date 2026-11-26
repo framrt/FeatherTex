@@ -7,17 +7,16 @@ arch=('x86_64')
 url="https://github.com/framrt/FeatherTex"
 license=('GPL-3.0-or-later')
 depends=(
-  'poppler-glib'
-  'cairo'
-  'glib2'
   'gcc-libs'
   'hicolor-icon-theme'
 )
 makedepends=(
   'cargo'
-  'pkgconf'
 )
 optdepends=(
+  'poppler-glib: anteprima PDF integrata ad alte prestazioni (caricata dinamicamente)'
+  'cairo: backend grafico per anteprima PDF in-process'
+  'poppler: fallback anteprima PDF esterna (pdftocairo/pdftoppm/pdfinfo)'
   'texlive-basic: compilazione pdfLaTeX'
   'texlive-latexrecommended: pacchetti accademici standard e natbib/booktabs'
   'texlive-binextra: texcount, chktex, latexdiff, latexmk e synctex'
@@ -26,7 +25,6 @@ optdepends=(
   'hunspell: controllo ortografico LaTeX-aware'
   'hunspell-it: dizionario italiano per hunspell'
   'hunspell-en_us: dizionario inglese US per hunspell'
-  'poppler: fallback PDF esterno'
   'wl-clipboard: supporto appunti su Wayland'
 )
 options=('!lto')

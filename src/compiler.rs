@@ -1893,7 +1893,7 @@ async fn render_pages_parallel(
     target_width_px: u32,
     target_height_px: u32,
 ) -> Result<Vec<RenderedPage>, String> {
-    #[cfg(has_poppler_glib)]
+    #[cfg(target_os = "linux")]
     {
         let p = pdf_path.clone();
         let req_pages = pages.clone();
@@ -2113,7 +2113,7 @@ fn parse_ppm_p6_to_rgba(
 }
 
 async fn pdf_metadata(pdf_path: &Path) -> Result<(usize, f32, f32, f32), String> {
-    #[cfg(has_poppler_glib)]
+    #[cfg(target_os = "linux")]
     {
         let p = pdf_path.to_path_buf();
         if let Ok(Ok(meta)) =
@@ -2487,9 +2487,12 @@ SyncTeX result end
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    #[cfg(has_poppler_glib)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn poppler_ffi_reads_metadata_and_renders_rgba_page() {
+        if !crate::poppler_ffi::is_available() {
+            return;
+        }
         let dir = std::env::temp_dir().join("feathertex_poppler_ffi_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
