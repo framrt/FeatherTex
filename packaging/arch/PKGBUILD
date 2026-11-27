@@ -49,8 +49,12 @@ package() {
   install -Dm644 "$_project_root/packaging/linux/feathertex.desktop" \
     "$pkgdir/usr/share/applications/feathertex.desktop"
 
-  install -Dm644 "$_project_root/packaging/linux/feathertex.svg" \
-    "$pkgdir/usr/share/icons/hicolor/scalable/apps/feathertex.svg"
+  install -Dm644 "$_project_root/assets/feathertex-512.png" \
+    "$pkgdir/usr/share/icons/hicolor/512x512/apps/feathertex.png"
+  install -Dm644 "$_project_root/assets/feathertex-256.png" \
+    "$pkgdir/usr/share/icons/hicolor/256x256/apps/feathertex.png"
+  install -Dm644 "$_project_root/assets/feathertex-128.png" \
+    "$pkgdir/usr/share/icons/hicolor/128x128/apps/feathertex.png"
 
   install -dm755 "$pkgdir/usr/share/feathertex/demo/chapters"
   install -Dm644 "$_project_root/demo/main.tex" \

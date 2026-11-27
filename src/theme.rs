@@ -381,38 +381,6 @@ pub fn welcome_card(theme: &Theme) -> container::Style {
     }
 }
 
-pub fn brand_badge(theme: &Theme) -> container::Style {
-    let p = palette(theme);
-    container::Style {
-        background: Some(Background::Color(p.accent)),
-        text_color: Some(Color::WHITE),
-        border: Border {
-            color: Color::TRANSPARENT,
-            width: 0.0,
-            radius: 14.0.into(),
-        },
-        shadow: Shadow {
-            color: p.shadow_color,
-            offset: Vector::new(0.0, 4.0),
-            blur_radius: 10.0,
-        },
-    }
-}
-
-pub fn small_brand_badge(theme: &Theme) -> container::Style {
-    let p = palette(theme);
-    container::Style {
-        background: Some(Background::Color(p.accent)),
-        text_color: Some(Color::WHITE),
-        border: Border {
-            color: Color::TRANSPARENT,
-            width: 0.0,
-            radius: 6.0.into(),
-        },
-        ..Default::default()
-    }
-}
-
 pub fn icon_chip(theme: &Theme) -> container::Style {
     let p = palette(theme);
     container::Style {

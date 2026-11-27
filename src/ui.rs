@@ -20,7 +20,7 @@ use iced::widget::{
     button, column, container, horizontal_rule, horizontal_space, image, mouse_area, row,
     scrollable, stack, text, text_editor, text_input, vertical_rule, Column, Row, Space,
 };
-use iced::{keyboard, Alignment, Color, Element, Length, Padding, Point, Rectangle, Size, Theme};
+use iced::{keyboard, Alignment, Element, Length, Padding, Point, Rectangle, Size, Theme};
 
 pub const EDITOR_PADDING: f32 = 16.0;
 const EDITOR_BOTTOM_BREATHING: f32 = 180.0;
@@ -135,6 +135,17 @@ fn close_panel_button(on_press: Message) -> Element<'static, Message> {
     .into()
 }
 
+use std::sync::OnceLock;
+
+fn app_icon_handle() -> image::Handle {
+    static HANDLE: OnceLock<image::Handle> = OnceLock::new();
+    HANDLE
+        .get_or_init(|| {
+            image::Handle::from_bytes(include_bytes!("../assets/feathertex-256.png").as_slice())
+        })
+        .clone()
+}
+
 pub fn view(app: &App) -> Element<'_, Message> {
     match app.screen {
         Screen::Welcome => view_welcome(app),
@@ -150,17 +161,9 @@ fn view_welcome(app: &App) -> Element<'_, Message> {
         "Tema Scuro"
     };
 
-    let emblem = container(
-        text("Fe")
-            .font(theme::ui_font_bold())
-            .size(24)
-            .color(Color::WHITE),
-    )
-    .width(Length::Fixed(58.0))
-    .height(Length::Fixed(58.0))
-    .center_x(Length::Fixed(58.0))
-    .center_y(Length::Fixed(58.0))
-    .style(theme::brand_badge);
+    let emblem = image(app_icon_handle())
+        .width(Length::Fixed(64.0))
+        .height(Length::Fixed(64.0));
 
     let header = column![
         emblem,
@@ -405,14 +408,9 @@ fn view_editor(app: &App) -> Element<'_, Message> {
             .on_press(Message::Compile)
     };
 
-    let brand_pill = container(
-        text("Fe")
-            .font(theme::ui_font_bold())
-            .size(11)
-            .color(Color::WHITE),
-    )
-    .padding([2, 6])
-    .style(theme::small_brand_badge);
+    let brand_pill = image(app_icon_handle())
+        .width(Length::Fixed(24.0))
+        .height(Length::Fixed(24.0));
 
     let compact_bar = app.window_size.width < 1040.0;
     let bar_btn_pad: [u16; 2] = if compact_bar { [4, 7] } else { [5, 10] };

@@ -24,14 +24,20 @@ mkdir -p \
   "$PKG_ROOT/DEBIAN" \
   "$PKG_ROOT/usr/bin" \
   "$PKG_ROOT/usr/share/applications" \
-  "$PKG_ROOT/usr/share/icons/hicolor/scalable/apps" \
+  "$PKG_ROOT/usr/share/icons/hicolor/512x512/apps" \
+  "$PKG_ROOT/usr/share/icons/hicolor/256x256/apps" \
+  "$PKG_ROOT/usr/share/icons/hicolor/128x128/apps" \
   "$PKG_ROOT/usr/share/feathertex/demo/chapters"
 
 install -m755 "$BIN_PATH" "$PKG_ROOT/usr/bin/feathertex"
 install -m644 "$ROOT_DIR/packaging/linux/feathertex.desktop" \
   "$PKG_ROOT/usr/share/applications/feathertex.desktop"
-install -m644 "$ROOT_DIR/packaging/linux/feathertex.svg" \
-  "$PKG_ROOT/usr/share/icons/hicolor/scalable/apps/feathertex.svg"
+install -m644 "$ROOT_DIR/assets/feathertex-512.png" \
+  "$PKG_ROOT/usr/share/icons/hicolor/512x512/apps/feathertex.png"
+install -m644 "$ROOT_DIR/assets/feathertex-256.png" \
+  "$PKG_ROOT/usr/share/icons/hicolor/256x256/apps/feathertex.png"
+install -m644 "$ROOT_DIR/assets/feathertex-128.png" \
+  "$PKG_ROOT/usr/share/icons/hicolor/128x128/apps/feathertex.png"
 
 if [[ -d "$ROOT_DIR/demo" ]]; then
   install -m644 "$ROOT_DIR/demo/main.tex" "$PKG_ROOT/usr/share/feathertex/demo/main.tex"

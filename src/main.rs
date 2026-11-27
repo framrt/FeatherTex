@@ -39,10 +39,23 @@ use symbols::{FormulaItem, PaletteTab, MATH_LIBRARIES};
 const MAX_CACHED_PDF_PAGES: usize = 12;
 
 pub fn main() -> iced::Result {
+    let icon = window::icon::from_rgba(
+        include_bytes!("../assets/icon_64.rgba").to_vec(),
+        64,
+        64,
+    )
+    .ok();
+
     iced::application(App::title, App::update, App::view)
         .window(window::Settings {
             size: Size::new(1280.0, 800.0),
             min_size: Some(Size::new(760.0, 500.0)),
+            icon,
+            #[cfg(target_os = "linux")]
+            platform_specific: window::settings::PlatformSpecific {
+                application_id: "feathertex".to_string(),
+                ..Default::default()
+            },
             ..Default::default()
         })
         .exit_on_close_request(false)

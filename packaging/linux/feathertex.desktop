@@ -5,6 +5,7 @@ GenericName=Editor LaTeX Scientifico
 Comment=Editor LaTeX veloce con anteprima PDF istantanea, ricette di compilazione, Outline e strumenti per la ricerca
 Exec=feathertex %f
 Icon=feathertex
+StartupWMClass=feathertex
 Terminal=false
 Categories=Office;Publishing;Science;Education;
 MimeType=text/x-tex;text/x-bibtex;
