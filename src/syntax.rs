@@ -1,18 +1,20 @@
+use crate::symbols::{FORMULAS, GREEK_SYMBOLS, LOGIC_SYMBOLS, MATH_SYMBOLS};
 use crate::theme;
 use iced::advanced::text::highlighter::{self, Highlighter};
 use iced::{Color, Font, Theme};
 use std::collections::HashSet;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LatexHighlightSettings {
     pub dark_mode: bool,
     pub revision: u64,
     pub misspelled: Arc<HashSet<String>>,
+    pub user_commands: Arc<HashSet<String>>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Token {
     Comment,
     Keyword,
@@ -93,12 +95,508 @@ impl Highlighter for LatexHighlighter {
 
     fn highlight_line(&mut self, line: &str) -> Self::Iterator<'_> {
         self.current_line += 1;
-        tokenize_line(line, &self.settings.misspelled).into_iter()
+        tokenize_line(line, &self.settings.misspelled, &self.settings.user_commands).into_iter()
     }
 
     fn current_line(&self) -> usize {
         self.current_line
     }
+}
+
+fn known_latex_commands() -> &'static HashSet<&'static str> {
+    static KNOWN: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    KNOWN.get_or_init(|| {
+        let mut set = HashSet::with_capacity(640);
+
+        let mut add_commands_from = |snippet: &'static str| {
+            let bytes = snippet.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' {
+                    let start = i;
+                    i += 1;
+                    if i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+                        while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+                            i += 1;
+                        }
+                        set.insert(&snippet[start..i]);
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        };
+
+        for sym in LOGIC_SYMBOLS
+            .iter()
+            .chain(GREEK_SYMBOLS.iter())
+            .chain(MATH_SYMBOLS.iter())
+        {
+            add_commands_from(sym.insert);
+        }
+        for formula in FORMULAS.iter() {
+            add_commands_from(formula.insert);
+        }
+
+        const EXTRA: &[&str] = &[
+            // Document & sectioning
+            "\\documentclass",
+            "\\LoadClass",
+            "\\usepackage",
+            "\\RequirePackage",
+            "\\PassOptionsToPackage",
+            "\\ProvidesPackage",
+            "\\ProvidesClass",
+            "\\begin",
+            "\\end",
+            "\\part",
+            "\\chapter",
+            "\\section",
+            "\\subsection",
+            "\\subsubsection",
+            "\\paragraph",
+            "\\subparagraph",
+            "\\title",
+            "\\subtitle",
+            "\\author",
+            "\\date",
+            "\\institute",
+            "\\thanks",
+            "\\and",
+            "\\today",
+            "\\maketitle",
+            "\\titlepage",
+            "\\tableofcontents",
+            "\\listoffigures",
+            "\\listoftables",
+            "\\appendix",
+            "\\frontmatter",
+            "\\mainmatter",
+            "\\backmatter",
+            "\\input",
+            "\\include",
+            "\\includeonly",
+            "\\subfile",
+            // Spacing, line/page breaks & formatting
+            "\\newline",
+            "\\newpage",
+            "\\clearpage",
+            "\\cleardoublepage",
+            "\\pagebreak",
+            "\\nopagebreak",
+            "\\linebreak",
+            "\\nolinebreak",
+            "\\noindent",
+            "\\indent",
+            "\\par",
+            "\\parskip",
+            "\\parindent",
+            "\\baselineskip",
+            "\\hspace",
+            "\\vspace",
+            "\\hfill",
+            "\\vfill",
+            "\\hrule",
+            "\\vrule",
+            "\\rule",
+            "\\quad",
+            "\\qquad",
+            "\\smallskip",
+            "\\medskip",
+            "\\bigskip",
+            "\\centering",
+            "\\raggedright",
+            "\\raggedleft",
+            "\\item",
+            "\\label",
+            "\\caption",
+            "\\footnote",
+            "\\footnotetext",
+            "\\footnotemark",
+            "\\marginpar",
+            "\\mbox",
+            "\\fbox",
+            "\\makebox",
+            "\\framebox",
+            "\\parbox",
+            "\\hbox",
+            "\\vbox",
+            "\\phantom",
+            "\\hphantom",
+            "\\vphantom",
+            "\\smash",
+            // Text styles & sizes
+            "\\textbf",
+            "\\textit",
+            "\\emph",
+            "\\texttt",
+            "\\textsc",
+            "\\textrm",
+            "\\textsf",
+            "\\textsl",
+            "\\textup",
+            "\\textmd",
+            "\\textnormal",
+            "\\underline",
+            "\\overline",
+            "\\bfseries",
+            "\\itshape",
+            "\\ttfamily",
+            "\\rmfamily",
+            "\\sffamily",
+            "\\scshape",
+            "\\slshape",
+            "\\upshape",
+            "\\mdseries",
+            "\\normalfont",
+            "\\tiny",
+            "\\scriptsize",
+            "\\footnotesize",
+            "\\small",
+            "\\normalsize",
+            "\\large",
+            "\\Large",
+            "\\LARGE",
+            "\\huge",
+            "\\Huge",
+            "\\LaTeX",
+            "\\TeX",
+            "\\LaTeXe",
+            "\\textbackslash",
+            "\\textasciitilde",
+            "\\textasciicircum",
+            "\\textquotedblleft",
+            "\\textquotedblright",
+            "\\textquoteleft",
+            "\\textquoteright",
+            "\\textbraceleft",
+            "\\textbraceright",
+            "\\textunderscore",
+            "\\textbar",
+            "\\textless",
+            "\\textgreater",
+            "\\ldots",
+            "\\dots",
+            "\\cdots",
+            "\\vdots",
+            "\\ddots",
+            // Macros, theorems, counters & internals
+            "\\newcommand",
+            "\\renewcommand",
+            "\\providecommand",
+            "\\newenvironment",
+            "\\renewenvironment",
+            "\\DeclareMathOperator",
+            "\\DeclarePairedDelimiter",
+            "\\def",
+            "\\edef",
+            "\\gdef",
+            "\\xdef",
+            "\\let",
+            "\\newtheorem",
+            "\\theoremstyle",
+            "\\qed",
+            "\\qedhere",
+            "\\proofname",
+            "\\setlength",
+            "\\addtolength",
+            "\\setcounter",
+            "\\addtocounter",
+            "\\stepcounter",
+            "\\refstepcounter",
+            "\\newcounter",
+            "\\numberwithin",
+            "\\thesection",
+            "\\theequation",
+            "\\thefigure",
+            "\\thetable",
+            "\\makeatletter",
+            "\\makeatother",
+            "\\AtBeginDocument",
+            "\\AtBeginSection",
+            "\\ignorespaces",
+            "\\relax",
+            "\\protect",
+            "\\expandafter",
+            "\\ifx",
+            "\\else",
+            "\\fi",
+            // References & bibliography
+            "\\ref",
+            "\\eqref",
+            "\\cref",
+            "\\Cref",
+            "\\crefrange",
+            "\\Crefrange",
+            "\\pageref",
+            "\\autoref",
+            "\\nameref",
+            "\\cite",
+            "\\parencite",
+            "\\textcite",
+            "\\footcite",
+            "\\autocite",
+            "\\citet",
+            "\\citep",
+            "\\citeauthor",
+            "\\citeyear",
+            "\\nocite",
+            "\\bibliography",
+            "\\bibliographystyle",
+            "\\addbibresource",
+            "\\printbibliography",
+            // Math core, fonts, delimiters & operators
+            "\\text",
+            "\\intertext",
+            "\\shortintertext",
+            "\\tag",
+            "\\nonumber",
+            "\\notag",
+            "\\allowdisplaybreaks",
+            "\\displaystyle",
+            "\\textstyle",
+            "\\scriptstyle",
+            "\\scriptscriptstyle",
+            "\\frac",
+            "\\dfrac",
+            "\\tfrac",
+            "\\cfrac",
+            "\\binom",
+            "\\dbinom",
+            "\\tbinom",
+            "\\sqrt",
+            "\\substack",
+            "\\stackrel",
+            "\\underset",
+            "\\overset",
+            "\\operatorname",
+            "\\limits",
+            "\\nolimits",
+            "\\left",
+            "\\right",
+            "\\middle",
+            "\\big",
+            "\\Big",
+            "\\bigg",
+            "\\Bigg",
+            "\\bigl",
+            "\\bigr",
+            "\\Bigl",
+            "\\Bigr",
+            "\\biggl",
+            "\\biggr",
+            "\\Biggl",
+            "\\Biggr",
+            "\\mathbb",
+            "\\mathcal",
+            "\\mathfrak",
+            "\\mathscr",
+            "\\mathrm",
+            "\\mathbf",
+            "\\mathit",
+            "\\mathsf",
+            "\\mathtt",
+            "\\mathnormal",
+            "\\mathclap",
+            "\\boldsymbol",
+            "\\bm",
+            "\\hat",
+            "\\widehat",
+            "\\check",
+            "\\tilde",
+            "\\widetilde",
+            "\\acute",
+            "\\grave",
+            "\\dot",
+            "\\ddot",
+            "\\dddot",
+            "\\breve",
+            "\\bar",
+            "\\vec",
+            "\\overbrace",
+            "\\underbrace",
+            "\\overrightarrow",
+            "\\overleftarrow",
+            "\\sum",
+            "\\prod",
+            "\\coprod",
+            "\\int",
+            "\\iint",
+            "\\iiint",
+            "\\iiiint",
+            "\\oint",
+            "\\bigcup",
+            "\\bigcap",
+            "\\bigsqcup",
+            "\\bigvee",
+            "\\bigwedge",
+            "\\bigoplus",
+            "\\bigotimes",
+            "\\lim",
+            "\\limsup",
+            "\\liminf",
+            "\\sup",
+            "\\inf",
+            "\\max",
+            "\\min",
+            "\\argmax",
+            "\\argmin",
+            "\\arg",
+            "\\det",
+            "\\dim",
+            "\\ker",
+            "\\deg",
+            "\\gcd",
+            "\\hom",
+            "\\Pr",
+            "\\exp",
+            "\\ln",
+            "\\log",
+            "\\lg",
+            "\\sin",
+            "\\cos",
+            "\\tan",
+            "\\cot",
+            "\\sec",
+            "\\csc",
+            "\\arcsin",
+            "\\arccos",
+            "\\arctan",
+            "\\sinh",
+            "\\cosh",
+            "\\tanh",
+            "\\coth",
+            "\\bmod",
+            "\\pmod",
+            "\\mod",
+            "\\pod",
+            "\\not",
+            "\\prime",
+            // Tables, figures, graphics & colors
+            "\\includegraphics",
+            "\\includesvg",
+            "\\graphicspath",
+            "\\textwidth",
+            "\\linewidth",
+            "\\textheight",
+            "\\paperwidth",
+            "\\paperheight",
+            "\\columnsep",
+            "\\toprule",
+            "\\midrule",
+            "\\bottomrule",
+            "\\cmidrule",
+            "\\morecmidrules",
+            "\\hline",
+            "\\cline",
+            "\\multicolumn",
+            "\\multirow",
+            "\\arraystretch",
+            "\\tabcolsep",
+            "\\color",
+            "\\textcolor",
+            "\\colorbox",
+            "\\fcolorbox",
+            "\\definecolor",
+            "\\rowcolor",
+            "\\cellcolor",
+            "\\columncolor",
+            // Hyperref, URLs, Beamer, TikZ, SI, Glossaries, Listings, latexdiff
+            "\\url",
+            "\\href",
+            "\\nolinkurl",
+            "\\hypertarget",
+            "\\hyperlink",
+            "\\hypersetup",
+            "\\phantomsection",
+            "\\frame",
+            "\\frametitle",
+            "\\framesubtitle",
+            "\\pause",
+            "\\onslide",
+            "\\only",
+            "\\uncover",
+            "\\visible",
+            "\\invisible",
+            "\\alert",
+            "\\usetheme",
+            "\\usecolortheme",
+            "\\usefonttheme",
+            "\\useinnertheme",
+            "\\useoutertheme",
+            "\\insertframenumber",
+            "\\inserttotalframenumber",
+            "\\usetikzlibrary",
+            "\\tikz",
+            "\\tikzset",
+            "\\draw",
+            "\\path",
+            "\\node",
+            "\\coordinate",
+            "\\fill",
+            "\\filldraw",
+            "\\shade",
+            "\\shadedraw",
+            "\\clip",
+            "\\foreach",
+            "\\pgfplotsset",
+            "\\addplot",
+            "\\legend",
+            "\\SI",
+            "\\si",
+            "\\num",
+            "\\ang",
+            "\\qty",
+            "\\unit",
+            "\\sisetup",
+            "\\gls",
+            "\\Gls",
+            "\\glspl",
+            "\\Glspl",
+            "\\newglossaryentry",
+            "\\makeglossaries",
+            "\\printglossaries",
+            "\\newacronym",
+            "\\acrshort",
+            "\\acrlong",
+            "\\acrfull",
+            "\\lstset",
+            "\\lstinline",
+            "\\lstinputlisting",
+            "\\mintinline",
+            "\\inputminted",
+            "\\setminted",
+            "\\orcidlink",
+            "\\geometry",
+            "\\newgeometry",
+            "\\restoregeometry",
+            "\\captionsetup",
+            "\\subcaption",
+            "\\DIFadd",
+            "\\DIFdel",
+            "\\DIFaddbegin",
+            "\\DIFaddend",
+            "\\DIFdelbegin",
+            "\\DIFdelend",
+            "\\DIFaddtex",
+            "\\DIFdeltex",
+        ];
+
+        for cmd in EXTRA {
+            set.insert(cmd);
+        }
+
+        set
+    })
+}
+
+fn is_known_latex_command(cmd: &str, user_commands: &HashSet<String>) -> bool {
+    // Escaped punctuation/single non-alphabetic command like `\\`, `\,`, `\%`, `\{`, `\}`, `\"`
+    if !cmd[1..].chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+        return true;
+    }
+    let normalized = cmd.strip_suffix('*').unwrap_or(cmd);
+    known_latex_commands().contains(normalized) || user_commands.contains(normalized)
 }
 
 fn is_non_prose_brace_command(cmd: &str) -> bool {
@@ -137,7 +635,11 @@ fn is_non_prose_brace_command(cmd: &str) -> bool {
     )
 }
 
-fn tokenize_line(line: &str, misspelled: &HashSet<String>) -> Vec<(Range<usize>, Token)> {
+fn tokenize_line(
+    line: &str,
+    misspelled: &HashSet<String>,
+    user_commands: &HashSet<String>,
+) -> Vec<(Range<usize>, Token)> {
     let mut tokens = Vec::new();
     let bytes = line.as_bytes();
     let len = bytes.len();
@@ -239,6 +741,7 @@ fn tokenize_line(line: &str, misspelled: &HashSet<String>) -> Vec<(Range<usize>,
                     Token::Math
                 }
                 "\\{" | "\\}" => Token::Bracket,
+                _ if !is_known_latex_command(cmd, user_commands) => Token::Misspelled,
                 _ if in_math => Token::MathCommand,
                 _ => Token::Command,
             };
@@ -373,4 +876,58 @@ fn tokenize_line(line: &str, misspelled: &HashSet<String>) -> Vec<(Range<usize>,
     }
 
     tokens
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flags_unknown_latex_command_and_allows_valid_and_user_macros() {
+        let misspelled = HashSet::from(["sbagliato".to_string()]);
+        let user_cmds = HashSet::from(["\\mycustommacro".to_string()]);
+
+        let toks = tokenize_line(
+            "Testo \\newlin \\newline \\mycustommacro \\sigma sbagliato.",
+            &misspelled,
+            &user_cmds,
+        );
+
+        let token_for = |needle: &str, line: &str| {
+            let start = line.find(needle).unwrap();
+            let end = start + needle.len();
+            toks.iter()
+                .find(|(r, _)| *r == (start..end))
+                .map(|(_, k)| *k)
+        };
+
+        let line = "Testo \\newlin \\newline \\mycustommacro \\sigma sbagliato.";
+        assert_eq!(token_for("\\newlin", line), Some(Token::Misspelled));
+        assert_eq!(token_for("\\newline", line), Some(Token::Command));
+        assert_eq!(token_for("\\mycustommacro", line), Some(Token::Command));
+        assert_eq!(token_for("\\sigma", line), Some(Token::Command));
+        assert_eq!(token_for("sbagliato", line), Some(Token::Misspelled));
+    }
+
+    #[test]
+    fn demo_tex_files_have_no_false_positive_unknown_commands() {
+        let empty = HashSet::new();
+        for src in [
+            include_str!("../demo/main.tex"),
+            include_str!("../demo/chapters/intro.tex"),
+            include_str!("../demo/chapters/results.tex"),
+        ] {
+            for line in src.lines() {
+                for (range, tok) in tokenize_line(line, &empty, &empty) {
+                    assert_ne!(
+                        tok,
+                        Token::Misspelled,
+                        "unexpected Token::Misspelled for {:?} in line {:?}",
+                        &line[range],
+                        line
+                    );
+                }
+            }
+        }
+    }
 }

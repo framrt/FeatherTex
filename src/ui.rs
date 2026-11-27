@@ -450,18 +450,54 @@ fn view_editor(app: &App) -> Element<'_, Message> {
         .style(theme::ghost_button)
         .on_press(Message::GoHome);
 
-    let update_pill: Element<'_, Message> = if let Some(upd) = &app.available_update {
+    let update_pill: Element<'_, Message> = if let Some(installed_ver) = &app.update_installed_version
+    {
         container(
             row![
                 button(
-                    text(format!("Aggiornamento v{} · Scarica", upd.version))
+                    text(format!("v{installed_ver} installata · Riavvia"))
                         .font(theme::ui_font_semibold())
                         .size(11)
-                        .color(pal.accent),
+                        .color(pal.success),
                 )
                 .padding([2, 6])
                 .style(theme::ghost_button)
-                .on_press(Message::OpenUpdateUrl),
+                .on_press(Message::RestartApp),
+                button(text("×").size(12).color(pal.text_muted))
+                    .padding([1, 4])
+                    .style(theme::ghost_button)
+                    .on_press(Message::DismissUpdateBanner),
+            ]
+            .spacing(2)
+            .align_y(Alignment::Center),
+        )
+        .padding([1, 4])
+        .style(theme::status_pill(pal.success, pal.success_soft))
+        .into()
+    } else if let Some(upd) = &app.available_update {
+        let btn = if app.is_updating {
+            button(
+                text(format!("Installazione v{}...", upd.version))
+                    .font(theme::ui_font_semibold())
+                    .size(11)
+                    .color(pal.accent),
+            )
+            .padding([2, 6])
+            .style(theme::ghost_button)
+        } else {
+            button(
+                text(format!("Aggiornamento v{} · Scarica", upd.version))
+                    .font(theme::ui_font_semibold())
+                    .size(11)
+                    .color(pal.accent),
+            )
+            .padding([2, 6])
+            .style(theme::ghost_button)
+            .on_press(Message::InstallUpdate)
+        };
+        container(
+            row![
+                btn,
                 button(text("×").size(12).color(pal.text_muted))
                     .padding([1, 4])
                     .style(theme::ghost_button)
@@ -1560,6 +1596,7 @@ fn view_editor_canvas(app: &App) -> Element<'_, Message> {
         dark_mode: app.dark_mode,
         revision: tab.doc.highlight_revision,
         misspelled: tab.misspelled_words.clone(),
+        user_commands: tab.doc.cached_user_commands.clone(),
     };
 
     let mut editor_widget = text_editor(&tab.doc.content)

@@ -51,6 +51,7 @@ pub struct Document {
     pub highlight_revision: u64,
     cached_max_line_cols: usize,
     cached_packages: HashSet<String>,
+    pub cached_user_commands: Arc<HashSet<String>>,
     undo_stack: Vec<UndoSnapshot>,
     redo_stack: Vec<UndoSnapshot>,
     last_typing_undo_at: Option<Instant>,
@@ -67,6 +68,7 @@ impl Default for Document {
             highlight_revision: 0,
             cached_max_line_cols: 0,
             cached_packages: HashSet::new(),
+            cached_user_commands: Arc::new(HashSet::new()),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             last_typing_undo_at: None,
@@ -183,6 +185,7 @@ impl Document {
         self.highlight_revision = self.highlight_revision.wrapping_add(1);
         let mut max_cols = 0usize;
         let mut packages = HashSet::new();
+        let mut user_cmds = HashSet::new();
 
         for line in self.content.lines() {
             let cols = visual_line_width(&line);
@@ -190,14 +193,16 @@ impl Document {
                 max_cols = cols;
             }
             extract_packages_from_line(&line, &mut packages);
+            extract_user_commands_from_line(&line, &mut user_cmds);
         }
 
         self.cached_max_line_cols = max_cols;
         self.cached_packages = packages;
+        self.cached_user_commands = Arc::new(user_cmds);
     }
 
     /// Fast O(1) cache update for single-line edits; falls back to full rebuild only
-    /// when structure changes (Enter, Paste, Backspace/Delete, or `\usepackage` lines).
+    /// when structure changes (Enter, Paste, Backspace/Delete, or `\usepackage` / macro definition lines).
     fn refresh_cache_after_edit(&mut self, prev_line_count: usize, edited_line: usize) {
         let new_line_count = self.content.line_count();
         if new_line_count != prev_line_count {
@@ -205,14 +210,20 @@ impl Document {
             return;
         }
 
-        let (cols, touches_package) = match self.content.line(edited_line) {
-            Some(line) => (visual_line_width(&line), line.contains("\\usepackage")),
+        let (cols, touches_meta) = match self.content.line(edited_line) {
+            Some(line) => (
+                visual_line_width(&line),
+                line.contains("\\usepackage")
+                    || line.contains("command")
+                    || line.contains("\\Declare")
+                    || line.contains("\\def"),
+            ),
             None => (0, false),
         };
         if cols > self.cached_max_line_cols {
             self.cached_max_line_cols = cols;
         }
-        if touches_package {
+        if touches_meta {
             self.rebuild_caches();
         }
     }
@@ -1176,6 +1187,58 @@ fn visual_line_width(s: &str) -> usize {
     cols
 }
 
+fn extract_user_commands_from_line(line: &str, out: &mut HashSet<String>) {
+    let active = strip_latex_comment(line);
+    for kw in [
+        "\\newcommand*",
+        "\\newcommand",
+        "\\renewcommand*",
+        "\\renewcommand",
+        "\\providecommand*",
+        "\\providecommand",
+        "\\DeclareMathOperator*",
+        "\\DeclareMathOperator",
+        "\\DeclarePairedDelimiter",
+    ] {
+        let mut rest = active;
+        while let Some(idx) = rest.find(kw) {
+            let after_kw = rest[idx + kw.len()..].trim_start();
+            let candidate = if let Some(braced) = after_kw.strip_prefix('{') {
+                braced.split('}').next().unwrap_or("").trim()
+            } else {
+                after_kw
+            };
+            if let Some(after_slash) = candidate.strip_prefix('\\') {
+                let name_len = after_slash
+                    .bytes()
+                    .take_while(|b| b.is_ascii_alphabetic())
+                    .count();
+                if name_len > 0 {
+                    out.insert(format!("\\{}", &after_slash[..name_len]));
+                }
+            }
+            rest = &rest[idx + kw.len()..];
+        }
+    }
+
+    // Also match `\def\mycmd`
+    let mut rest = active;
+    while let Some(idx) = rest.find("\\def") {
+        let after = &rest[idx + 4..];
+        let trimmed = after.trim_start();
+        if let Some(after_slash) = trimmed.strip_prefix('\\') {
+            let name_len = after_slash
+                .bytes()
+                .take_while(|b| b.is_ascii_alphabetic())
+                .count();
+            if name_len > 0 {
+                out.insert(format!("\\{}", &after_slash[..name_len]));
+            }
+        }
+        rest = after;
+    }
+}
+
 fn extract_packages_from_line(line: &str, out: &mut HashSet<String>) {
     let active = strip_latex_comment(line);
     let mut rest = active;
@@ -1549,6 +1612,7 @@ mod tests {
             highlight_revision: 0,
             cached_max_line_cols: 0,
             cached_packages: HashSet::new(),
+            cached_user_commands: Arc::new(HashSet::new()),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             last_typing_undo_at: None,

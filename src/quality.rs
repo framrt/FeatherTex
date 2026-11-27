@@ -834,6 +834,9 @@ pub async fn pick_old_tex_and_latexdiff(current_tex_path: PathBuf) -> Result<Pat
 pub struct UpdateInfo {
     pub version: String,
     pub url: String,
+    pub deb_url: Option<String>,
+    pub linux_bin_url: Option<String>,
+    pub win_zip_url: Option<String>,
 }
 
 fn parse_semver_tuple(raw: &str) -> Option<(u32, u32, u32)> {
@@ -877,6 +880,54 @@ fn extract_json_string_field(json: &str, key: &str) -> Option<String> {
     None
 }
 
+fn extract_release_asset_urls(json: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let mut deb_url = None;
+    let mut linux_bin_url = None;
+    let mut win_zip_url = None;
+
+    let needle = "\"browser_download_url\"";
+    let mut rest = json;
+    while let Some(pos) = rest.find(needle) {
+        rest = &rest[pos + needle.len()..];
+        let Some(colon) = rest.find(':') else {
+            break;
+        };
+        let after_colon = rest[colon + 1..].trim_start();
+        let Some(inner) = after_colon.strip_prefix('"') else {
+            continue;
+        };
+        let mut url = String::new();
+        let mut escaped = false;
+        let mut closed = false;
+        for ch in inner.chars() {
+            if escaped {
+                url.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                closed = true;
+                break;
+            } else {
+                url.push(ch);
+            }
+        }
+        if !closed || !url.starts_with("https://github.com/") {
+            continue;
+        }
+        let lower = url.to_ascii_lowercase();
+        if lower.ends_with(".deb") && deb_url.is_none() {
+            deb_url = Some(url);
+        } else if lower.contains("linux-x86_64") && !lower.ends_with(".zip") && linux_bin_url.is_none() {
+            linux_bin_url = Some(url);
+        } else if lower.contains("windows") && lower.ends_with(".zip") && win_zip_url.is_none() {
+            win_zip_url = Some(url);
+        }
+    }
+
+    (deb_url, linux_bin_url, win_zip_url)
+}
+
 pub async fn check_for_update() -> Option<UpdateInfo> {
     let out = Command::new("curl")
         .kill_on_drop(true)
@@ -912,8 +963,296 @@ pub async fn check_for_update() -> Option<UpdateInfo> {
     let url = extract_json_string_field(&body, "html_url")
         .filter(|u| u.starts_with("https://github.com/"))
         .unwrap_or_else(|| "https://github.com/framrt/FeatherTex/releases/latest".to_string());
+    let (deb_url, linux_bin_url, win_zip_url) = extract_release_asset_urls(&body);
 
-    Some(UpdateInfo { version, url })
+    Some(UpdateInfo {
+        version,
+        url,
+        deb_url,
+        linux_bin_url,
+        win_zip_url,
+    })
+}
+
+async fn download_https_to_file(url: &str, dest: &Path) -> Result<(), String> {
+    let out = Command::new("curl")
+        .kill_on_drop(true)
+        .args([
+            "-sSL",
+            "--fail",
+            "--max-time",
+            "120",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "-H",
+            "User-Agent: FeatherTex",
+            "-o",
+        ])
+        .arg(dest)
+        .arg("--")
+        .arg(url)
+        .output()
+        .await
+        .map_err(|e| format!("Impossibile avviare curl: {e}"))?;
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("Download fallito: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn pipe_bytes_through_tar(tar_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut child = Command::new("tar")
+        .kill_on_drop(true)
+        .args(["-xO", "./usr/bin/feathertex"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Impossibile avviare tar: {e}"))?;
+
+    if let Some(stdin) = child.stdin.take() {
+        write_and_close_stdin(stdin, tar_bytes).await;
+    }
+    let out = child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("Errore estrazione tar: {e}"))?;
+    if out.status.success() && !out.stdout.is_empty() {
+        Ok(out.stdout)
+    } else {
+        Err(format!(
+            "Impossibile estrarre binario dal pacchetto: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn extract_binary_from_deb(deb_path: &Path, bin_dest: &Path) -> Result<(), String> {
+    // Path 1: `dpkg-deb --fsys-tarfile` (Debian/Ubuntu/Mint)
+    if let Ok(dpkg_out) = Command::new("dpkg-deb")
+        .kill_on_drop(true)
+        .arg("--fsys-tarfile")
+        .arg(deb_path)
+        .output()
+        .await
+    {
+        if dpkg_out.status.success() && !dpkg_out.stdout.is_empty() {
+            let bin_bytes = pipe_bytes_through_tar(&dpkg_out.stdout).await?;
+            tokio::fs::write(bin_dest, &bin_bytes)
+                .await
+                .map_err(|e| format!("Errore scrittura binario estratto: {e}"))?;
+            return Ok(());
+        }
+    }
+
+    // Path 2: `ar` (binutils, works on Arch Linux without dpkg)
+    let list_out = Command::new("ar")
+        .kill_on_drop(true)
+        .arg("t")
+        .arg(deb_path)
+        .output()
+        .await
+        .map_err(|_| {
+            "Strumento 'dpkg-deb' o 'ar' non trovato per estrarre l'aggiornamento".to_string()
+        })?;
+    if !list_out.status.success() {
+        return Err("Impossibile leggere il contenuto del pacchetto .deb".to_string());
+    }
+    let archive_name = String::from_utf8_lossy(&list_out.stdout)
+        .lines()
+        .find(|l| l.trim().starts_with("data.tar"))
+        .map(|l| l.trim().to_string())
+        .ok_or_else(|| "Archivio data.tar non trovato nel .deb".to_string())?;
+
+    let ar_out = Command::new("ar")
+        .kill_on_drop(true)
+        .arg("p")
+        .arg(deb_path)
+        .arg(&archive_name)
+        .output()
+        .await
+        .map_err(|e| format!("Errore estrazione ar: {e}"))?;
+    if !ar_out.status.success() || ar_out.stdout.is_empty() {
+        return Err("Estrazione data.tar dal .deb fallita".to_string());
+    }
+
+    let bin_bytes = pipe_bytes_through_tar(&ar_out.stdout).await?;
+    tokio::fs::write(bin_dest, &bin_bytes)
+        .await
+        .map_err(|e| format!("Errore scrittura binario estratto: {e}"))?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn is_dir_writable(dir: &Path) -> bool {
+    let probe = dir.join(format!(".feathertex_write_probe_{}", std::process::id()));
+    if std::fs::File::create(&probe).is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        true
+    } else {
+        false
+    }
+}
+
+pub async fn install_update(info: UpdateInfo) -> Result<String, String> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let current_exe = std::env::current_exe()
+            .map_err(|e| format!("Impossibile individuare l'eseguibile corrente: {e}"))?;
+        let exe_dir = current_exe
+            .parent()
+            .ok_or_else(|| "Cartella eseguibile non valida".to_string())?;
+        let writable = is_dir_writable(exe_dir);
+        let has_apt = Path::new("/usr/bin/apt-get").is_file() || Path::new("/bin/apt-get").is_file();
+        let has_pkexec =
+            Path::new("/usr/bin/pkexec").is_file() || Path::new("/bin/pkexec").is_file();
+
+        // System-wide Debian/Mint/Ubuntu install: upgrade cleanly through apt-get via pkexec
+        if !writable && has_apt && has_pkexec {
+            if let Some(deb_url) = info.deb_url.as_deref() {
+                let deb_path =
+                    std::env::temp_dir().join(format!("feathertex_update_{}.deb", info.version));
+                download_https_to_file(deb_url, &deb_path).await?;
+                let status = Command::new("pkexec")
+                    .arg("apt-get")
+                    .arg("install")
+                    .arg("-y")
+                    .arg(&deb_path)
+                    .output()
+                    .await;
+                let _ = tokio::fs::remove_file(&deb_path).await;
+                let out = status.map_err(|e| format!("Errore avvio pkexec/apt-get: {e}"))?;
+                if !out.status.success() {
+                    let msg = String::from_utf8_lossy(&out.stderr);
+                    return Err(format!("Installazione .deb annullata o fallita: {}", msg.trim()));
+                }
+                return Ok(info.version);
+            }
+        }
+
+        // Portable binary or Arch Linux / other distros: download binary (or extract from .deb)
+        let tmp_bin = std::env::temp_dir().join(format!("feathertex_bin_{}", info.version));
+        if let Some(bin_url) = info.linux_bin_url.as_deref() {
+            download_https_to_file(bin_url, &tmp_bin).await?;
+        } else if let Some(deb_url) = info.deb_url.as_deref() {
+            let deb_path =
+                std::env::temp_dir().join(format!("feathertex_update_{}.deb", info.version));
+            download_https_to_file(deb_url, &deb_path).await?;
+            let ext_res = extract_binary_from_deb(&deb_path, &tmp_bin).await;
+            let _ = tokio::fs::remove_file(&deb_path).await;
+            ext_res?;
+        } else {
+            return Err("Nessun pacchetto Linux trovato nella Release GitHub.".to_string());
+        }
+
+        std::fs::set_permissions(&tmp_bin, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("Impossibile rendere eseguibile il nuovo binario: {e}"))?;
+
+        if writable {
+            let sibling_tmp = current_exe.with_file_name(format!(
+                ".feathertex_update_tmp_{}",
+                std::process::id()
+            ));
+            let copy_res = tokio::fs::copy(&tmp_bin, &sibling_tmp).await;
+            let _ = tokio::fs::remove_file(&tmp_bin).await;
+            copy_res.map_err(|e| format!("Errore copia aggiornamento: {e}"))?;
+            std::fs::set_permissions(&sibling_tmp, std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("Errore permessi aggiornamento: {e}"))?;
+            if let Err(e) = std::fs::rename(&sibling_tmp, &current_exe) {
+                let _ = std::fs::remove_file(&sibling_tmp);
+                return Err(format!("Errore sostituzione binario: {e}"));
+            }
+        } else if has_pkexec {
+            let out = Command::new("pkexec")
+                .args(["install", "-Dm755"])
+                .arg(&tmp_bin)
+                .arg(&current_exe)
+                .output()
+                .await
+                .map_err(|e| format!("Errore avvio pkexec: {e}"))?;
+            let _ = tokio::fs::remove_file(&tmp_bin).await;
+            if !out.status.success() {
+                return Err("Autorizzazione pkexec annullata o installazione fallita.".to_string());
+            }
+        } else {
+            let _ = tokio::fs::remove_file(&tmp_bin).await;
+            return Err(
+                "Cartella di installazione protetta e 'pkexec' non disponibile.".to_string(),
+            );
+        }
+
+        Ok(info.version)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let zip_url = info
+            .win_zip_url
+            .as_deref()
+            .ok_or_else(|| "Nessun pacchetto Windows trovato nella Release.".to_string())?;
+        let current_exe = std::env::current_exe()
+            .map_err(|e| format!("Impossibile individuare feathertex.exe: {e}"))?;
+        let stage_dir =
+            std::env::temp_dir().join(format!("feathertex_win_update_{}", info.version));
+        let _ = tokio::fs::remove_dir_all(&stage_dir).await;
+        tokio::fs::create_dir_all(&stage_dir)
+            .await
+            .map_err(|e| format!("Errore creazione cartella temporanea: {e}"))?;
+        let zip_path = stage_dir.join("update.zip");
+        download_https_to_file(zip_url, &zip_path).await?;
+
+        let extract_cmd = format!(
+            "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
+            zip_path.display().to_string().replace('\'', "''"),
+            stage_dir.display().to_string().replace('\'', "''"),
+        );
+        let extract_out = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &extract_cmd])
+            .output()
+            .await
+            .map_err(|e| format!("Errore PowerShell: {e}"))?;
+        if !extract_out.status.success() {
+            return Err("Impossibile estrarre lo ZIP di aggiornamento.".to_string());
+        }
+
+        let new_exe = stage_dir.join("feathertex.exe");
+        if !new_exe.is_file() {
+            return Err("feathertex.exe non trovato nell'archivio ZIP.".to_string());
+        }
+
+        // Schedule replacement + relaunch after process exits
+        let new_exe_str = new_exe.display().to_string().replace('\'', "''");
+        let cur_exe_str = current_exe.display().to_string().replace('\'', "''");
+        let swap_script = format!(
+            "Start-Sleep -Seconds 2; Move-Item -LiteralPath '{new_exe_str}' -Destination '{cur_exe_str}' -Force; Start-Process -FilePath '{cur_exe_str}'"
+        );
+        std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                &swap_script,
+            ])
+            .spawn()
+            .map_err(|e| format!("Impossibile avviare il programma di aggiornamento: {e}"))?;
+
+        Ok(info.version)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        let _ = info;
+        Err("Aggiornamento automatico non supportato su questo sistema.".to_string())
+    }
 }
 
 #[cfg(test)]
@@ -997,12 +1336,16 @@ Un'ipotesi fondamentale. % commento ignoratoxyz
         assert!(!is_newer_version("v0.1.2", "0.1.2"));
         assert!(!is_newer_version("v0.1.1", "0.1.2"));
 
-        let sample = r#"{"tag_name": "v0.2.0", "html_url": "https://github.com/framrt/FeatherTex/releases/tag/v0.2.0"}"#;
+        let sample = r#"{"tag_name": "v0.2.0", "html_url": "https://github.com/framrt/FeatherTex/releases/tag/v0.2.0", "assets": [{"browser_download_url": "https://github.com/framrt/FeatherTex/releases/download/v0.2.0/feathertex_0.2.0_amd64.deb"}, {"browser_download_url": "https://github.com/framrt/FeatherTex/releases/download/v0.2.0/feathertex-linux-x86_64"}, {"browser_download_url": "https://github.com/framrt/FeatherTex/releases/download/v0.2.0/feathertex-0.2.0-windows-x86_64.zip"}]}"#;
         assert_eq!(extract_json_string_field(sample, "tag_name").as_deref(), Some("v0.2.0"));
         assert_eq!(
             extract_json_string_field(sample, "html_url").as_deref(),
             Some("https://github.com/framrt/FeatherTex/releases/tag/v0.2.0")
         );
+        let (deb, bin, win) = extract_release_asset_urls(sample);
+        assert!(deb.unwrap().ends_with(".deb"));
+        assert!(bin.unwrap().ends_with("feathertex-linux-x86_64"));
+        assert!(win.unwrap().ends_with(".zip"));
     }
 }
 

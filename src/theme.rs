@@ -363,26 +363,6 @@ pub fn context_menu_item(theme: &Theme, status: button::Status) -> button::Style
     }
 }
 
-pub fn error_card_button(theme: &Theme, status: button::Status) -> button::Style {
-    let p = palette(theme);
-    let (bg, border_color) = match status {
-        button::Status::Hovered => (p.error_soft, p.error),
-        button::Status::Pressed => (p.bg_base, p.error),
-        _ => (p.bg_base, p.border_subtle),
-    };
-
-    button::Style {
-        background: Some(Background::Color(bg)),
-        text_color: p.text_primary,
-        border: Border {
-            color: border_color,
-            width: 1.0,
-            radius: 8.0.into(),
-        },
-        shadow: Shadow::default(),
-    }
-}
-
 pub fn welcome_card(theme: &Theme) -> container::Style {
     let p = palette(theme);
     container::Style {

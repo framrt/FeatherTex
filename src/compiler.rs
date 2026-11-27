@@ -2292,20 +2292,6 @@ pub fn open_pdf_external(pdf_path: &Path) {
         .spawn();
 }
 
-pub fn open_url_external(url: &str) {
-    #[cfg(target_os = "linux")]
-    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(url).spawn();
-
-    #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("rundll32.exe")
-        .arg("url.dll,FileProtocolHandler")
-        .arg(url)
-        .spawn();
-}
-
 /// Returns `<project_dir>/<name>.pdf` when given `.build/<name>.pdf`.
 pub fn user_facing_pdf_path(pdf_path: &Path) -> PathBuf {
     if let (Some(fname), Some(build_dir)) = (pdf_path.file_name(), pdf_path.parent()) {

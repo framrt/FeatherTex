@@ -248,6 +248,8 @@ pub struct App {
     pub match_results: Vec<MatchCandidate>,
     internal_clipboard: Option<String>,
     pub available_update: Option<UpdateInfo>,
+    pub is_updating: bool,
+    pub update_installed_version: Option<String>,
     spell_rev: u64,
     spell_unavailable_lang: Option<String>,
 }
@@ -350,6 +352,8 @@ impl Default for App {
             match_results: Vec::new(),
             internal_clipboard: None,
             available_update: None,
+            is_updating: false,
+            update_installed_version: None,
             spell_rev: 0,
             spell_unavailable_lang: None,
         }
@@ -511,7 +515,9 @@ pub enum Message {
     CleanBuild,
     BuildCleaned(u64, Result<String, String>),
     UpdateCheckFinished(Option<UpdateInfo>),
-    OpenUpdateUrl,
+    InstallUpdate,
+    UpdateInstalled(Result<String, String>),
+    RestartApp,
     DismissUpdateBanner,
     SavePdfAs,
     PdfExported(Result<PathBuf, String>),
@@ -3651,14 +3657,45 @@ impl App {
                 self.available_update = info;
                 Task::none()
             }
-            Message::OpenUpdateUrl => {
-                if let Some(upd) = &self.available_update {
-                    compiler::open_url_external(&upd.url);
+            Message::InstallUpdate => {
+                if self.is_updating {
+                    return Task::none();
                 }
+                let Some(upd) = self.available_update.clone() else {
+                    return Task::none();
+                };
+                self.is_updating = true;
+                self.status = format!("Download e installazione v{}...", upd.version);
+                Task::perform(quality::install_update(upd), Message::UpdateInstalled)
+            }
+            Message::UpdateInstalled(Ok(ver)) => {
+                self.is_updating = false;
+                self.available_update = None;
+                self.update_installed_version = Some(ver.clone());
+                self.status = format!("Aggiornamento v{ver} completato · clicca Riavvia");
+                #[cfg(target_os = "windows")]
+                {
+                    self.save_all_open_files();
+                    return iced::exit();
+                }
+                #[cfg(not(target_os = "windows"))]
                 Task::none()
+            }
+            Message::UpdateInstalled(Err(err)) => {
+                self.is_updating = false;
+                self.status = err;
+                Task::none()
+            }
+            Message::RestartApp => {
+                self.save_all_open_files();
+                if let Ok(exe) = std::env::current_exe() {
+                    let _ = std::process::Command::new(exe).spawn();
+                }
+                iced::exit()
             }
             Message::DismissUpdateBanner => {
                 self.available_update = None;
+                self.update_installed_version = None;
                 Task::none()
             }
             Message::SavePdfAs => {
