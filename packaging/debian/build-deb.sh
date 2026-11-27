@@ -57,7 +57,7 @@ Architecture: $ARCH
 Installed-Size: $INSTALLED_KB
 Maintainer: FeatherTex Contributors <noreply@example.invalid>
 Depends: libc6 (>= 2.35)
-Recommends: libpoppler-glib8 | libpoppler-glib8t64, libcairo2, libglib2.0-0 | libglib2.0-0t64, texlive-latex-base, texlive-latex-recommended, texlive-science, texlive-extra-utils, biber, chktex, hunspell, hunspell-it, hunspell-en-us, latexdiff, poppler-utils
+Recommends: curl, libpoppler-glib8 | libpoppler-glib8t64, libcairo2, libglib2.0-0 | libglib2.0-0t64, texlive-latex-base, texlive-latex-recommended, texlive-science, texlive-extra-utils, biber, chktex, hunspell, hunspell-it, hunspell-en-us, latexdiff, poppler-utils
 Description: Editor LaTeX leggero e veloce per ricercatori
  FeatherTex combina scrittura fluida con preamboli .fmt precompilati,
  anteprima PDF Poppler+Cairo, ricette di compilazione, Outline multi-file,

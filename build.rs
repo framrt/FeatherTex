@@ -3,10 +3,19 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=FEATHERTEX_VERSION");
     println!("cargo:rerun-if-changed=assets/feathertex.rc");
     println!("cargo:rerun-if-changed=assets/feathertex.ico");
     println!("cargo:rerun-if-changed=assets/icon_64.rgba");
     println!("cargo:rerun-if-changed=assets/feathertex-256.png");
+
+    let pkg_version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.1.0".to_string());
+    let app_version = std::env::var("FEATHERTEX_VERSION")
+        .ok()
+        .map(|v| v.trim().trim_start_matches(['v', 'V']).to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or(pkg_version);
+    println!("cargo:rustc-env=FEATHERTEX_APP_VERSION={app_version}");
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os != "windows" {

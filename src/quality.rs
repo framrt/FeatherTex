@@ -830,6 +830,8 @@ pub async fn pick_old_tex_and_latexdiff(current_tex_path: PathBuf) -> Result<Pat
     generate_latexdiff_tex(handle.path(), &current_tex_path).await
 }
 
+pub const APP_VERSION: &str = env!("FEATHERTEX_APP_VERSION");
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateInfo {
     pub version: String,
@@ -929,7 +931,8 @@ fn extract_release_asset_urls(json: &str) -> (Option<String>, Option<String>, Op
 }
 
 pub async fn check_for_update() -> Option<UpdateInfo> {
-    let out = Command::new("curl")
+    let url = "https://api.github.com/repos/framrt/FeatherTex/releases/latest";
+    let curl_out = Command::new("curl")
         .kill_on_drop(true)
         .args([
             "-sSL",
@@ -945,29 +948,51 @@ pub async fn check_for_update() -> Option<UpdateInfo> {
             "-H",
             "User-Agent: FeatherTex",
             "--",
-            "https://api.github.com/repos/framrt/FeatherTex/releases/latest",
+            url,
         ])
         .output()
-        .await
-        .ok()?;
+        .await;
 
-    if !out.status.success() {
-        return None;
-    }
-    let body = String::from_utf8_lossy(&out.stdout);
+    let stdout_bytes = match curl_out {
+        Ok(o) if o.status.success() && !o.stdout.is_empty() => o.stdout,
+        _ => {
+            let wget_out = Command::new("wget")
+                .kill_on_drop(true)
+                .args([
+                    "-q",
+                    "--timeout=6",
+                    "--https-only",
+                    "--header=Accept: application/vnd.github+json",
+                    "--header=User-Agent: FeatherTex",
+                    "-O",
+                    "-",
+                    "--",
+                    url,
+                ])
+                .output()
+                .await
+                .ok()?;
+            if !wget_out.status.success() {
+                return None;
+            }
+            wget_out.stdout
+        }
+    };
+
+    let body = String::from_utf8_lossy(&stdout_bytes);
     let tag = extract_json_string_field(&body, "tag_name")?;
     let version = tag.trim().trim_start_matches(['v', 'V']).to_string();
-    if !is_newer_version(&version, env!("CARGO_PKG_VERSION")) {
+    if !is_newer_version(&version, APP_VERSION) {
         return None;
     }
-    let url = extract_json_string_field(&body, "html_url")
+    let html_url = extract_json_string_field(&body, "html_url")
         .filter(|u| u.starts_with("https://github.com/"))
         .unwrap_or_else(|| "https://github.com/framrt/FeatherTex/releases/latest".to_string());
     let (deb_url, linux_bin_url, win_zip_url) = extract_release_asset_urls(&body);
 
     Some(UpdateInfo {
         version,
-        url,
+        url: html_url,
         deb_url,
         linux_bin_url,
         win_zip_url,
@@ -975,7 +1000,7 @@ pub async fn check_for_update() -> Option<UpdateInfo> {
 }
 
 async fn download_https_to_file(url: &str, dest: &Path) -> Result<(), String> {
-    let out = Command::new("curl")
+    let curl_res = Command::new("curl")
         .kill_on_drop(true)
         .args([
             "-sSL",
@@ -994,14 +1019,38 @@ async fn download_https_to_file(url: &str, dest: &Path) -> Result<(), String> {
         .arg("--")
         .arg(url)
         .output()
-        .await
-        .map_err(|e| format!("Impossibile avviare curl: {e}"))?;
+        .await;
 
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("Download fallito: {}", stderr.trim()));
+    match curl_res {
+        Ok(out) if out.status.success() => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let wget_out = Command::new("wget")
+                .kill_on_drop(true)
+                .args([
+                    "-q",
+                    "--timeout=120",
+                    "--https-only",
+                    "--header=User-Agent: FeatherTex",
+                    "-O",
+                ])
+                .arg(dest)
+                .arg("--")
+                .arg(url)
+                .output()
+                .await
+                .map_err(|we| format!("Né curl né wget disponibili per scaricare: {we}"))?;
+            if !wget_out.status.success() {
+                let stderr = String::from_utf8_lossy(&wget_out.stderr);
+                return Err(format!("Download fallito (wget): {}", stderr.trim()));
+            }
+            Ok(())
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            Err(format!("Download fallito: {}", stderr.trim()))
+        }
+        Err(e) => Err(format!("Impossibile avviare curl: {e}")),
     }
-    Ok(())
 }
 
 #[cfg(target_os = "linux")]

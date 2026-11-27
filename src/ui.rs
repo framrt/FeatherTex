@@ -356,11 +356,14 @@ fn view_welcome(app: &App) -> Element<'_, Message> {
     }
 
     card_content = card_content.push(
-        text("Ctrl+N Nuovo  ·  Ctrl+O Apri  ·  Ctrl+S Salva  ·  Ctrl+B Compila")
-            .size(11)
-            .align_x(Alignment::Center)
-            .width(Length::Fill)
-            .color(pal.text_faint),
+        text(format!(
+            "FeatherTex v{}  ·  Ctrl+N Nuovo  ·  Ctrl+O Apri  ·  Ctrl+S Salva  ·  Ctrl+B Compila",
+            crate::quality::APP_VERSION
+        ))
+        .size(11)
+        .align_x(Alignment::Center)
+        .width(Length::Fill)
+        .color(pal.text_faint),
     );
 
     let card = container(card_content).style(theme::welcome_card);
@@ -369,6 +372,7 @@ fn view_welcome(app: &App) -> Element<'_, Message> {
 
     let theme_overlay = container(
         row![
+            view_update_pill(app),
             horizontal_space(),
             button(text(theme_label).size(12))
                 .padding([6, 12])
@@ -385,6 +389,71 @@ fn view_welcome(app: &App) -> Element<'_, Message> {
         .height(Length::Fill)
         .style(theme::app_background)
         .into()
+}
+
+fn view_update_pill(app: &App) -> Element<'_, Message> {
+    let pal = theme::palette_for(app.dark_mode);
+    if let Some(installed_ver) = &app.update_installed_version {
+        container(
+            row![
+                button(
+                    text(format!("v{installed_ver} installata · Riavvia"))
+                        .font(theme::ui_font_semibold())
+                        .size(11)
+                        .color(pal.success),
+                )
+                .padding([2, 6])
+                .style(theme::ghost_button)
+                .on_press(Message::RestartApp),
+                button(text("×").size(12).color(pal.text_muted))
+                    .padding([1, 4])
+                    .style(theme::ghost_button)
+                    .on_press(Message::DismissUpdateBanner),
+            ]
+            .spacing(2)
+            .align_y(Alignment::Center),
+        )
+        .padding([1, 4])
+        .style(theme::status_pill(pal.success, pal.success_soft))
+        .into()
+    } else if let Some(upd) = &app.available_update {
+        let btn = if app.is_updating {
+            button(
+                text(format!("Installazione v{}...", upd.version))
+                    .font(theme::ui_font_semibold())
+                    .size(11)
+                    .color(pal.accent),
+            )
+            .padding([2, 6])
+            .style(theme::ghost_button)
+        } else {
+            button(
+                text(format!("Aggiornamento v{} · Scarica", upd.version))
+                    .font(theme::ui_font_semibold())
+                    .size(11)
+                    .color(pal.accent),
+            )
+            .padding([2, 6])
+            .style(theme::ghost_button)
+            .on_press(Message::InstallUpdate)
+        };
+        container(
+            row![
+                btn,
+                button(text("×").size(12).color(pal.text_muted))
+                    .padding([1, 4])
+                    .style(theme::ghost_button)
+                    .on_press(Message::DismissUpdateBanner),
+            ]
+            .spacing(2)
+            .align_y(Alignment::Center),
+        )
+        .padding([1, 4])
+        .style(theme::status_pill(pal.accent, pal.accent_soft))
+        .into()
+    } else {
+        Space::with_width(Length::Fixed(0.0)).into()
+    }
 }
 
 fn view_editor(app: &App) -> Element<'_, Message> {
@@ -448,68 +517,7 @@ fn view_editor(app: &App) -> Element<'_, Message> {
         .style(theme::ghost_button)
         .on_press(Message::GoHome);
 
-    let update_pill: Element<'_, Message> = if let Some(installed_ver) = &app.update_installed_version
-    {
-        container(
-            row![
-                button(
-                    text(format!("v{installed_ver} installata · Riavvia"))
-                        .font(theme::ui_font_semibold())
-                        .size(11)
-                        .color(pal.success),
-                )
-                .padding([2, 6])
-                .style(theme::ghost_button)
-                .on_press(Message::RestartApp),
-                button(text("×").size(12).color(pal.text_muted))
-                    .padding([1, 4])
-                    .style(theme::ghost_button)
-                    .on_press(Message::DismissUpdateBanner),
-            ]
-            .spacing(2)
-            .align_y(Alignment::Center),
-        )
-        .padding([1, 4])
-        .style(theme::status_pill(pal.success, pal.success_soft))
-        .into()
-    } else if let Some(upd) = &app.available_update {
-        let btn = if app.is_updating {
-            button(
-                text(format!("Installazione v{}...", upd.version))
-                    .font(theme::ui_font_semibold())
-                    .size(11)
-                    .color(pal.accent),
-            )
-            .padding([2, 6])
-            .style(theme::ghost_button)
-        } else {
-            button(
-                text(format!("Aggiornamento v{} · Scarica", upd.version))
-                    .font(theme::ui_font_semibold())
-                    .size(11)
-                    .color(pal.accent),
-            )
-            .padding([2, 6])
-            .style(theme::ghost_button)
-            .on_press(Message::InstallUpdate)
-        };
-        container(
-            row![
-                btn,
-                button(text("×").size(12).color(pal.text_muted))
-                    .padding([1, 4])
-                    .style(theme::ghost_button)
-                    .on_press(Message::DismissUpdateBanner),
-            ]
-            .spacing(2)
-            .align_y(Alignment::Center),
-        )
-        .padding([1, 4])
-        .style(theme::status_pill(pal.accent, pal.accent_soft))
-        .into()
-    } else {
-        Space::with_width(Length::Fixed(0.0)).into()
-    };
+    let update_pill = view_update_pill(app);
 
     let theme_btn_label = if app.dark_mode { "Chiaro" } else { "Scuro" };
 
