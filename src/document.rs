@@ -713,15 +713,22 @@ impl Document {
             }
         }
 
-        self.insert_snippet(completion);
-
-        if let Some(first_empty) = completion.find("{}") {
-            let chars_after_open = completion[first_empty + 1..].chars().count();
-            for _ in 0..chars_after_open {
+        if completion.ends_with("{}")
+            && !completion[..completion.len() - 2].contains("{}")
+        {
+            let (line_idx, col) = self.content.cursor_position();
+            let (_, after) = self.split_line_at_cursor(line_idx, col);
+            if after.starts_with('{') {
+                let stem = &completion[..completion.len() - 2];
+                self.insert_snippet(stem);
                 self.content
-                    .perform(text_editor::Action::Move(text_editor::Motion::Left));
+                    .perform(text_editor::Action::Move(text_editor::Motion::Right));
+                return;
             }
         }
+
+        // `insert_snippet` already moves the cursor inside the first `{}` when single-line.
+        self.insert_snippet(completion);
     }
 
     /// O(1) lookup against the cached preamble packages.
@@ -1797,5 +1804,21 @@ mod tests {
         assert_eq!(doc.text().trim_end_matches('\n'), "Teorema di \\gamma e \\beta.");
         assert!(doc.undo());
         assert_eq!(doc.text().trim_end_matches('\n'), "Teorema di \\alpha e \\beta.");
+    }
+
+    #[test]
+    fn complete_prefix_places_cursor_inside_braces() {
+        let mut doc = doc_with("\\emp");
+        doc.move_cursor_to(0, 4);
+        doc.complete_prefix(4, "\\emph{}", true);
+        doc.insert_snippet("ciao");
+        assert_eq!(doc.text().trim_end_matches('\n'), "\\emph{ciao}");
+
+        // Also when braces already follow the cursor (e.g. `\emp|{}` -> `\emph{|}`).
+        let mut doc2 = doc_with("\\emp{}");
+        doc2.move_cursor_to(0, 4);
+        doc2.complete_prefix(4, "\\emph{}", true);
+        doc2.insert_snippet("mondo");
+        assert_eq!(doc2.text().trim_end_matches('\n'), "\\emph{mondo}");
     }
 }

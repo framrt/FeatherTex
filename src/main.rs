@@ -34,6 +34,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use symbols::{FormulaItem, PaletteTab, MATH_LIBRARIES};
 
+#[derive(Debug, Clone, Copy)]
+pub struct PdfMagnifierHover {
+    pub page: usize,
+    pub x_ratio: f32,
+    pub y_ratio: f32,
+    pub window_pos: Point,
+    pub page_width: f32,
+    pub page_height: f32,
+}
+
 /// Maximum number of decoded PDF pages retained in memory & GPU atlas at once.
 /// Keeps GPU VRAM small and prevents `iced_wgpu` O(N^2) texture-array reallocations.
 const MAX_CACHED_PDF_PAGES: usize = 12;
@@ -262,6 +272,9 @@ pub struct App {
     internal_clipboard: Option<String>,
     pub available_update: Option<UpdateInfo>,
     pub is_updating: bool,
+    pub is_isolated_compiling: bool,
+    pub pdf_magnifier_enabled: bool,
+    pub pdf_magnifier_hover: Option<PdfMagnifierHover>,
     pub update_installed_version: Option<String>,
     spell_rev: u64,
     spell_unavailable_lang: Option<String>,
@@ -366,6 +379,9 @@ impl Default for App {
             internal_clipboard: None,
             available_update: None,
             is_updating: false,
+            is_isolated_compiling: false,
+            pdf_magnifier_enabled: false,
+            pdf_magnifier_hover: None,
             update_installed_version: None,
             spell_rev: 0,
             spell_unavailable_lang: None,
@@ -523,10 +539,23 @@ pub enum Message {
     Save,
     FileSaved(u64, Result<PathBuf, String>),
     Compile,
+    CompileIsolated,
+    IsolatedCompileFinished(u64, Result<CompileResult, String>),
     CompileAfterSave(u64, Result<PathBuf, String>),
     CompileFinished(u64, Result<CompileResult, String>),
     CleanBuild,
     BuildCleaned(u64, Result<String, String>),
+    TogglePdfMagnifier,
+    PdfMagnifierMoved {
+        page: usize,
+        x_ratio: f32,
+        y_ratio: f32,
+        window_pos: Point,
+        page_width: f32,
+        page_height: f32,
+    },
+    PdfMagnifierLeft,
+    OpenAuthorProfile,
     UpdateCheckFinished(Option<UpdateInfo>),
     InstallUpdate,
     UpdateInstalled(Result<String, String>),
@@ -628,8 +657,37 @@ impl App {
         app.editor_font_size = saved.editor_font_size;
         app.auto_close = saved.auto_close;
         app.live_compile = saved.live_compile;
+        app.pdf_magnifier_enabled = saved.pdf_magnifier;
         app.spell_lang = saved.spell_lang;
         app.persist_settings_enabled = true;
+
+        let cwd = std::env::current_dir().ok();
+        let mut cli_open_tasks = Vec::new();
+        for raw_arg in std::env::args_os().skip(1) {
+            if raw_arg.to_string_lossy().starts_with('-') {
+                continue;
+            }
+            let raw_path = PathBuf::from(&raw_arg);
+            let candidate = if raw_path.is_absolute() {
+                raw_path
+            } else if let Some(ref base) = cwd {
+                base.join(raw_path)
+            } else {
+                raw_path
+            };
+            if candidate.is_file() {
+                cli_open_tasks.push(Task::perform(
+                    document::read_file(candidate),
+                    Message::FileOpened,
+                ));
+                if cli_open_tasks.len() >= 16 {
+                    break;
+                }
+            }
+        }
+        if !cli_open_tasks.is_empty() {
+            app.screen = Screen::Editor;
+        }
 
         let detect_pkgs = Task::perform(
             compiler::detect_installed_packages(),
@@ -641,7 +699,9 @@ impl App {
             Some(id) => window::get_scale_factor(id).map(Message::ScaleFactorDetected),
             None => Task::none(),
         });
-        (app, Task::batch([detect_pkgs, check_update, detect_scale]))
+        let mut tasks = vec![detect_pkgs, check_update, detect_scale];
+        tasks.extend(cli_open_tasks);
+        (app, Task::batch(tasks))
     }
 
     fn persist_user_settings(&self) {
@@ -653,6 +713,7 @@ impl App {
             editor_font_size: self.editor_font_size,
             auto_close: self.auto_close,
             live_compile: self.live_compile,
+            pdf_magnifier: self.pdf_magnifier_enabled,
             spell_lang: self.spell_lang.clone(),
         });
     }
@@ -1212,6 +1273,7 @@ impl App {
         self.active_prefix = None;
         self.show_folder_menu = false;
         self.show_recipe_menu = false;
+        self.pdf_magnifier_hover = None;
         self.reset_gpu_pdf_cache();
         self.refresh_folder_files();
         self.refresh_outline();
@@ -1425,12 +1487,11 @@ impl App {
         let fit_w = ui::pdf_fit_base_width(self);
         let (logical_w, logical_h) =
             ui::pdf_page_dimensions(fit_w, self.pdf_zoom, self.tab().pdf_aspect_ratio);
-        let phys_w = (logical_w * self.window_scale_factor)
-            .round()
-            .clamp(240.0, 2800.0) as u32;
-        let phys_h = (logical_h * self.window_scale_factor)
-            .round()
-            .clamp(240.0, 4000.0) as u32;
+        // 2x supersampling keeps thin vector strokes (TikZ, tikz-cd arrows, subscripts)
+        // sharp both in the main view and inside the interactive PDF magnifier.
+        let render_scale = (self.window_scale_factor * 2.0).max(2.0);
+        let phys_w = (logical_w * render_scale).round().clamp(240.0, 3600.0) as u32;
+        let phys_h = (logical_h * render_scale).round().clamp(240.0, 4800.0) as u32;
         (phys_w, phys_h)
     }
 
@@ -2395,13 +2456,14 @@ impl App {
                 self.is_compiling = true;
                 self.status = "Compilazione PDF delle modifiche (latexdiff)...".to_string();
                 let target_w = self.target_pdf_render_width();
-                let default_recipe = recipes::builtin_recipes().into_iter().next().unwrap();
+                let active_recipe = self.recipe_config.active_recipe();
+                let shell_escape = self.recipe_config.shell_escape;
                 Task::perform(
                     compiler::compile_with_recipe(
                         diff_tex_path,
                         None,
-                        default_recipe,
-                        false,
+                        active_recipe,
+                        shell_escape,
                         1,
                         1,
                         target_w,
@@ -3505,8 +3567,8 @@ impl App {
                 let use_fast_live = self.can_use_fast_live_pdflatex();
 
                 // Fast path A (Overleaf-style instant swap): a background compile for this exact
-                // buffer is already finished -> save `.tex`, atomically swap `.build/live/*.pdf`
-                // over `.build/*.pdf`, and display immediately in ~0ms!
+                // buffer is already finished -> save `.tex`, atomically move live PDF into the
+                // document folder, and display immediately in ~0ms!
                 if use_fast_live {
                     if let Some(existing_path) = path.clone() {
                         let has_matching_staged = self
@@ -3700,9 +3762,14 @@ impl App {
                 Task::none()
             }
             Message::RestartApp => {
+                let open_paths: Vec<PathBuf> =
+                    self.tabs.iter().filter_map(|t| t.doc.path.clone()).collect();
                 self.save_all_open_files();
                 if let Ok(exe) = std::env::current_exe() {
-                    let _ = std::process::Command::new(exe).spawn();
+                    let mut cmd = std::process::Command::new(exe);
+                    compiler::hide_std_console_window(&mut cmd);
+                    cmd.args(&open_paths);
+                    let _ = cmd.spawn();
                 }
                 iced::exit()
             }
@@ -3798,6 +3865,123 @@ impl App {
                     self.status = "Log copiato negli appunti".to_string();
                     return clipboard::write(selected);
                 }
+                Task::none()
+            }
+            Message::CompileIsolated => {
+                if self.screen != Screen::Editor || self.is_isolated_compiling {
+                    return Task::none();
+                }
+                self.pdf_context_menu = None;
+                self.show_folder_menu = false;
+                self.show_recipe_menu = false;
+                let tab_id = self.tab().id;
+                let contents = self.tab().doc.text();
+                if let Some(real_path) = self.tab().doc.path.clone() {
+                    if self.tab().doc.is_dirty {
+                        if let Err(e) =
+                            document::write_file_atomic_sync(&real_path, contents.as_bytes())
+                        {
+                            self.status = format!("Errore salvataggio: {e}");
+                            return Task::none();
+                        }
+                        self.tab_mut().doc.is_dirty = false;
+                        recent::record_recent(&mut self.recent_files, real_path);
+                    }
+                }
+                let tex_path = self
+                    .tab()
+                    .doc
+                    .path
+                    .clone()
+                    .unwrap_or_else(|| std::env::temp_dir().join("documento_senza_titolo.tex"));
+                let master_override = self.effective_master_path();
+                let active_recipe = self.recipe_config.active_recipe();
+                let shell_escape = self.recipe_config.shell_escape;
+                let open_buffers = self.collect_open_buffers();
+                let sync_line = self
+                    .tab()
+                    .last_edited_line
+                    .unwrap_or_else(|| self.tab().doc.content.cursor_position().0 + 1);
+                let fallback_page = self.current_pdf_start_page();
+                let target_w = self.target_pdf_render_width();
+                self.is_isolated_compiling = true;
+                self.status = format!(
+                    "Compilazione isolata ({}) di {}...",
+                    active_recipe.name,
+                    self.tab().doc.file_name()
+                );
+                Task::perform(
+                    compiler::compile_isolated_file(
+                        tex_path,
+                        contents,
+                        master_override,
+                        active_recipe,
+                        shell_escape,
+                        open_buffers,
+                        sync_line,
+                        fallback_page,
+                        target_w,
+                    ),
+                    move |res| Message::IsolatedCompileFinished(tab_id, res),
+                )
+            }
+            Message::IsolatedCompileFinished(tab_id, Ok(res)) => {
+                self.is_isolated_compiling = false;
+                let ok = res.success;
+                let elapsed = res.elapsed_secs;
+                let Some(idx) = self.find_tab_by_id(tab_id) else {
+                    return Task::none();
+                };
+                let task = self.apply_compile_result(idx, res, false);
+                if ok && idx == self.active_tab {
+                    self.status = format!("Compilazione isolata riuscita ({elapsed:.1}s)");
+                }
+                task
+            }
+            Message::IsolatedCompileFinished(_, Err(err)) => {
+                self.is_isolated_compiling = false;
+                self.status = err;
+                Task::none()
+            }
+            Message::TogglePdfMagnifier => {
+                self.pdf_magnifier_enabled = !self.pdf_magnifier_enabled;
+                if !self.pdf_magnifier_enabled {
+                    self.pdf_magnifier_hover = None;
+                }
+                self.persist_user_settings();
+                self.status = if self.pdf_magnifier_enabled {
+                    "Lente di ingrandimento PDF attivata".to_string()
+                } else {
+                    "Lente di ingrandimento disattivata".to_string()
+                };
+                Task::none()
+            }
+            Message::PdfMagnifierMoved {
+                page,
+                x_ratio,
+                y_ratio,
+                window_pos,
+                page_width,
+                page_height,
+            } => {
+                if self.pdf_magnifier_enabled {
+                    self.pdf_magnifier_hover = Some(PdfMagnifierHover {
+                        page,
+                        x_ratio,
+                        y_ratio,
+                        window_pos,
+                        page_width,
+                        page_height,
+                    });
+                }
+                Task::none()
+            }
+            Message::PdfMagnifierLeft => {
+                self.pdf_magnifier_hover = None;
+                Task::none()
+            }
+            Message::OpenAuthorProfile => {
+                compiler::open_url_external("https://github.com/framrt");
                 Task::none()
             }
         }

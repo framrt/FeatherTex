@@ -61,6 +61,247 @@ pub struct CompileResult {
     pub elapsed_secs: f32,
 }
 
+pub(crate) fn hide_console_window(_cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        _cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+}
+
+pub(crate) fn hide_std_console_window(_cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        _cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+}
+
+fn to_tex_slash_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn tex_env_search_paths(dirs: &[&Path]) -> String {
+    #[cfg(windows)]
+    const SEP: char = ';';
+    #[cfg(not(windows))]
+    const SEP: char = ':';
+
+    let mut out = String::new();
+    let mut seen = Vec::new();
+    for &dir in dirs {
+        let s = dir.to_string_lossy().into_owned();
+        if s.is_empty() || seen.iter().any(|existing| existing == &s) {
+            continue;
+        }
+        out.push_str(&s);
+        out.push(SEP);
+        seen.push(s);
+    }
+    out
+}
+
+fn tex_env_search_path(dir: &Path) -> String {
+    tex_env_search_paths(&[dir])
+}
+
+/// Maps any compiler output filename to its categorized folder under `<project_dir>/output/`.
+/// Uses `ausiliari` (instead of `aux`, which is a reserved device name on Windows).
+fn output_category_subdir(file_name: &str) -> Option<&'static str> {
+    let lower = file_name.to_ascii_lowercase();
+    if lower.ends_with(".synctex.gz") || lower.ends_with(".synctex") {
+        return Some("synctex");
+    }
+    if lower.ends_with(".run.xml") || lower.ends_with(".bbl") || lower.ends_with(".bcf") {
+        return Some("bibliografia");
+    }
+    if lower.ends_with(".fdb_latexmk") {
+        return Some("ausiliari");
+    }
+    let ext = Path::new(&lower).extension().and_then(|e| e.to_str())?;
+    match ext {
+        "pdf" => Some("pdf"),
+        "log" | "blg" | "ilg" | "glg" => Some("log"),
+        "aux" | "toc" | "out" | "lof" | "lot" | "nav" | "snm" | "vrb" | "idx" | "ind"
+        | "glo" | "gls" | "ist" | "acn" | "acr" | "alg" | "fls" | "xdv" | "dvi" => {
+            Some("ausiliari")
+        }
+        _ => None,
+    }
+}
+
+/// Resolves `(project_root, synctex_dir)` from a PDF path.
+/// When `pdf_path` is `<project>/output/pdf/<name>.pdf`, returns `(Some(<project>), Some(<project>/output/synctex))`.
+fn pdf_project_and_synctex_dirs(pdf_path: &Path) -> (Option<PathBuf>, Option<PathBuf>) {
+    if let Some(pdf_dir) = pdf_path.parent() {
+        if pdf_dir.file_name().and_then(|n| n.to_str()) == Some("pdf") {
+            if let Some(out_dir) = pdf_dir.parent() {
+                if out_dir.file_name().and_then(|n| n.to_str()) == Some("output") {
+                    if let Some(project_dir) = out_dir.parent() {
+                        return (
+                            Some(project_dir.to_path_buf()),
+                            Some(out_dir.join("synctex")),
+                        );
+                    }
+                }
+            }
+        }
+        return (Some(pdf_dir.to_path_buf()), None);
+    }
+    (None, None)
+}
+
+/// Returns `(project_dir, is_diff_file)` so `output/diff/<stem>_diff.tex` compiles with
+/// `project_dir` as its working root and places outputs in `<project_dir>/output/`.
+fn detect_output_project_root(tex_parent: &Path) -> (PathBuf, bool) {
+    if tex_parent.file_name().and_then(|n| n.to_str()) == Some("diff") {
+        if let Some(out_dir) = tex_parent.parent() {
+            if out_dir.file_name().and_then(|n| n.to_str()) == Some("output") {
+                if let Some(proj) = out_dir.parent() {
+                    return (proj.to_path_buf(), true);
+                }
+            }
+        }
+    }
+    (tex_parent.to_path_buf(), false)
+}
+
+fn collect_files_recursive_sync(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        if p.is_dir() {
+            collect_files_recursive_sync(root, &p, out);
+        } else if p.is_file() {
+            if let Ok(rel) = p.strip_prefix(root) {
+                out.push(rel.to_path_buf());
+            }
+        }
+    }
+}
+
+fn replicate_project_subdirs_sync(project_root: &Path, cur: &Path, dest_root: &Path, depth: usize) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(cur) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') || name == "output" || name == "target" {
+            continue;
+        }
+        if let Ok(rel) = p.strip_prefix(project_root) {
+            let _ = std::fs::create_dir_all(dest_root.join(rel));
+        }
+        replicate_project_subdirs_sync(project_root, &p, dest_root, depth + 1);
+    }
+}
+
+/// Prepares an isolated flat staging directory for a compilation pass, seeding prior
+/// auxiliary and bibliography state from `<output_dir>/ausiliari` and `<output_dir>/bibliografia`.
+fn prepare_stage_dir(project_dir: &Path, output_dir: &Path, stage_dir: &Path) -> std::io::Result<()> {
+    if stage_dir.exists() {
+        let _ = std::fs::remove_dir_all(stage_dir);
+    }
+    std::fs::create_dir_all(stage_dir)?;
+    replicate_project_subdirs_sync(project_dir, project_dir, stage_dir, 0);
+
+    for cat in ["ausiliari", "bibliografia"] {
+        let cat_dir = output_dir.join(cat);
+        if !cat_dir.is_dir() {
+            continue;
+        }
+        let mut rels = Vec::new();
+        collect_files_recursive_sync(&cat_dir, &cat_dir, &mut rels);
+        for rel in rels {
+            let src = cat_dir.join(&rel);
+            let dst = stage_dir.join(&rel);
+            if let Some(p) = dst.parent() {
+                let _ = std::fs::create_dir_all(p);
+            }
+            let _ = std::fs::copy(&src, &dst);
+        }
+    }
+    Ok(())
+}
+
+/// Distributes all compiler outputs from `stage_dir` into categorized folders under `output_dir`
+/// (`pdf/`, `log/`, `bibliografia/`, `synctex/`, `ausiliari/`) and removes matching generated
+/// clutter left directly inside `project_dir`.
+fn organize_stage_into_output_dirs(
+    project_dir: &Path,
+    stage_dir: &Path,
+    output_dir: &Path,
+    stem: &str,
+) {
+    let mut rels = Vec::new();
+    collect_files_recursive_sync(stage_dir, stage_dir, &mut rels);
+
+    for rel in &rels {
+        let Some(fname) = rel.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(cat) = output_category_subdir(fname) else {
+            continue;
+        };
+        let src = stage_dir.join(rel);
+        let dst = if cat == "ausiliari" {
+            output_dir.join(cat).join(rel)
+        } else {
+            output_dir.join(cat).join(fname)
+        };
+        if let Some(parent) = dst.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = move_file_atomic_or_copy(&src, &dst);
+
+        // Clean matching generated clutter from the user's project root (never touching .tex/.bib/images).
+        let legacy_in_root = project_dir.join(rel);
+        if legacy_in_root.is_file() {
+            let _ = std::fs::remove_file(&legacy_in_root);
+        }
+    }
+
+    for ext in CLEANABLE_AUX_EXTENSIONS {
+        let old = project_dir.join(format!("{stem}.{ext}"));
+        if old.is_file() {
+            let _ = std::fs::remove_file(&old);
+        }
+    }
+    let old_pdf = project_dir.join(format!("{stem}.pdf"));
+    if old_pdf.is_file() && output_dir.join("pdf").join(format!("{stem}.pdf")).is_file() {
+        let _ = std::fs::remove_file(&old_pdf);
+    }
+}
+
+fn preamble_supports_fmt(preamble: &str) -> bool {
+    for raw_line in preamble.lines() {
+        let code = raw_line.split('%').next().unwrap_or("");
+        let lower = code.to_ascii_lowercase();
+        if lower.contains("tikz") || lower.contains("pgf") || lower.contains("{beamer}") {
+            return false;
+        }
+    }
+    true
+}
+
 /// Checks via a single `kpsewhich` call which LaTeX packages in `MATH_LIBRARIES`
 /// are actually installed in the user's TeX Live distribution.
 pub async fn detect_installed_packages() -> Option<HashSet<String>> {
@@ -69,11 +310,9 @@ pub async fn detect_installed_packages() -> Option<HashSet<String>> {
         .map(|lib| format!("{}.sty", lib.package))
         .collect();
 
-    let output = Command::new("kpsewhich")
-        .args(&sty_names)
-        .output()
-        .await
-        .ok()?;
+    let mut cmd = Command::new("kpsewhich");
+    hide_console_window(&mut cmd);
+    let output = cmd.args(&sty_names).output().await.ok()?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut installed = HashSet::new();
@@ -140,23 +379,27 @@ fn split_preamble_and_body(source: &str) -> Option<(String, String)> {
     Some((preamble, body))
 }
 
-/// Ensures a precompiled binary format `.build/preamble_<hash>.fmt` exists for `preamble`.
-/// Built once per unique preamble via `pdflatex -ini` (~0.8s), then reused across all manual
-/// and live compiles to skip reloading `article.cls`, `amsmath`, `tikz`, etc.
+/// Ensures a precompiled binary format `<cache_dir>/preamble_<hash>.fmt` exists for `preamble`.
+/// Built once per unique preamble via `pdflatex -ini` (~0.8s), then reused across compiles.
+/// Skipped for TikZ/PGF/Beamer preambles whose PGF driver/catcode setup cannot safely be frozen in `.fmt`.
 async fn ensure_preamble_fmt(
     parent_dir: &Path,
-    build_dir: &Path,
+    cache_dir: &Path,
     preamble: &str,
 ) -> Option<String> {
+    if !preamble_supports_fmt(preamble) {
+        return None;
+    }
+
     let hash = fnv1a_64(preamble.as_bytes());
     let fmt_name = format!("preamble_{hash:016x}");
-    let fmt_file = build_dir.join(format!("{fmt_name}.fmt"));
+    let fmt_file = cache_dir.join(format!("{fmt_name}.fmt"));
     if fmt_file.exists() {
         return Some(fmt_name);
     }
 
     // Remove outdated preamble caches when the user modifies their preamble.
-    if let Ok(mut entries) = tokio::fs::read_dir(build_dir).await {
+    if let Ok(mut entries) = tokio::fs::read_dir(cache_dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name();
             let s = name.to_string_lossy();
@@ -166,22 +409,24 @@ async fn ensure_preamble_fmt(
         }
     }
 
-    let fmt_tex = build_dir.join(format!("{fmt_name}.tex"));
-    let fmt_tex_rel = format!(".build/{fmt_name}.tex");
+    let fmt_tex_name = format!("{fmt_name}.tex");
+    let fmt_tex = cache_dir.join(&fmt_tex_name);
     let dump_src = format!("{preamble}\n\\dump\n");
     tokio::fs::write(&fmt_tex, dump_src).await.ok()?;
 
     let job_arg = format!("-jobname={fmt_name}");
-    let out = Command::new("pdflatex")
-        .current_dir(parent_dir)
+    let mut cmd = Command::new("pdflatex");
+    hide_console_window(&mut cmd);
+    let out = cmd
+        .current_dir(cache_dir)
         .kill_on_drop(true)
+        .env("TEXINPUTS", tex_env_search_path(parent_dir))
         .args([
             "-ini",
             "-interaction=batchmode",
-            "-output-directory=.build",
             &job_arg,
             "&pdflatex",
-            &fmt_tex_rel,
+            &fmt_tex_name,
         ])
         .output()
         .await
@@ -195,7 +440,7 @@ async fn ensure_preamble_fmt(
     }
 }
 
-/// Asynchronously precompiles the document's preamble into `.build/preamble_<hash>.fmt`
+/// Asynchronously precompiles the document's preamble into the shadow live cache directory
 /// right when a file is opened, so even the very first compile is accelerated.
 pub async fn preload_preamble_fmt(tex_path: PathBuf, contents: String) {
     let Some(parent_dir) = tex_path.parent() else {
@@ -204,17 +449,21 @@ pub async fn preload_preamble_fmt(tex_path: PathBuf, contents: String) {
     let Some((preamble, _)) = split_preamble_and_body(&contents) else {
         return;
     };
-    let build_dir = parent_dir.join(".build");
-    if tokio::fs::create_dir_all(&build_dir).await.is_err() {
+    if !preamble_supports_fmt(&preamble) {
         return;
     }
-    let _ = ensure_preamble_fmt(parent_dir, &build_dir, &preamble).await;
+    let live_dir = live_dir_for(parent_dir);
+    if tokio::fs::create_dir_all(&live_dir).await.is_err() {
+        return;
+    }
+    let _ = ensure_preamble_fmt(parent_dir, &live_dir, &preamble).await;
 }
 
 const AUX_EXTENSIONS: &[&str] = &["aux", "toc", "out", "lof", "lot", "nav", "snm", "vrb"];
 
 /// Returns a RAM-disk live build directory in `/dev/shm` when available (eliminating disk I/O
-/// while typing), falling back to `<project>/.build/live` otherwise.
+/// while typing), falling back to `<temp_dir>/feathertex_live_<hash>` otherwise so the
+/// user's project directory stays clean like TeXstudio.
 #[cfg(unix)]
 fn current_uid() -> u32 {
     extern "C" {
@@ -224,30 +473,18 @@ fn current_uid() -> u32 {
 }
 
 fn live_dir_for(parent_dir: &Path) -> PathBuf {
+    let canon = std::fs::canonicalize(parent_dir).unwrap_or_else(|_| parent_dir.to_path_buf());
+    let hash = fnv1a_64(canon.to_string_lossy().as_bytes());
+    #[cfg(unix)]
+    let name = format!("feathertex_live_{}_{hash:016x}", current_uid());
+    #[cfg(not(unix))]
+    let name = format!("feathertex_live_{hash:016x}");
+
     let shm = Path::new("/dev/shm");
     if shm.is_dir() {
-        let canon = std::fs::canonicalize(parent_dir).unwrap_or_else(|_| parent_dir.to_path_buf());
-        let hash = fnv1a_64(canon.to_string_lossy().as_bytes());
-        #[cfg(unix)]
-        let name = format!("feathertex_live_{}_{hash:016x}", current_uid());
-        #[cfg(not(unix))]
-        let name = format!("feathertex_live_{hash:016x}");
         shm.join(name)
     } else {
-        parent_dir.join(".build").join("live")
-    }
-}
-
-/// Atomically mirrors the built PDF from `.build/<stem>.pdf` to `<project_dir>/<stem>.pdf`
-/// so users always see their compiled PDF right beside their `.tex` file (like a standard editor),
-/// while keeping auxiliary files tidy inside `.build/`.
-fn mirror_pdf_to_project_dir(build_pdf: &Path, project_dir: &Path, file_name: &std::ffi::OsStr) {
-    if !build_pdf.exists() {
-        return;
-    }
-    let user_pdf = project_dir.join(file_name);
-    if let Ok(bytes) = std::fs::read(build_pdf) {
-        let _ = crate::document::write_file_atomic_sync(&user_pdf, &bytes);
+        std::env::temp_dir().join(name)
     }
 }
 
@@ -269,16 +506,19 @@ fn move_file_atomic_or_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Seeds `live_dir` with newer/missing `.aux`, `.toc`, `.out`, etc. from `.build/` so
-/// background compiles avoid redundant 2nd `pdflatex` passes for existing cross-references.
-fn sync_aux_files_to_live(build_dir: &Path, live_dir: &Path, stem: &str) {
-    for ext in AUX_EXTENSIONS {
-        let src = build_dir.join(format!("{stem}.{ext}"));
-        if !src.exists() {
-            continue;
+/// Seeds `live_dir` with newer/missing `.aux`, `.toc`, `.bbl`, `.bcf`, etc. from `<project_dir>/output/`
+/// so background compiles avoid redundant passes for existing cross-references and citations.
+fn sync_aux_files_to_live(project_dir: &Path, live_dir: &Path, stem: &str) {
+    replicate_project_subdirs_sync(project_dir, project_dir, live_dir, 0);
+    let output_dir = project_dir.join("output");
+    let copy_if_newer = |src: &Path, dst: &Path| {
+        if !src.is_file() {
+            return;
         }
-        let dst = live_dir.join(format!("{stem}.{ext}"));
-        let should_copy = match (std::fs::metadata(&src), std::fs::metadata(&dst)) {
+        if let Some(p) = dst.parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
+        let should_copy = match (std::fs::metadata(src), std::fs::metadata(dst)) {
             (Ok(s_meta), Ok(d_meta)) => s_meta
                 .modified()
                 .ok()
@@ -288,48 +528,74 @@ fn sync_aux_files_to_live(build_dir: &Path, live_dir: &Path, stem: &str) {
             _ => false,
         };
         if should_copy {
-            let _ = std::fs::copy(&src, &dst);
+            let _ = std::fs::copy(src, dst);
         }
+    };
+
+    for ext in AUX_EXTENSIONS {
+        let src = output_dir.join("ausiliari").join(format!("{stem}.{ext}"));
+        copy_if_newer(&src, &live_dir.join(format!("{stem}.{ext}")));
+    }
+    let aux_dir = output_dir.join("ausiliari");
+    if aux_dir.is_dir() {
+        let mut rels = Vec::new();
+        collect_files_recursive_sync(&aux_dir, &aux_dir, &mut rels);
+        for rel in rels {
+            if rel.extension().and_then(|e| e.to_str()) == Some("aux") {
+                copy_if_newer(&aux_dir.join(&rel), &live_dir.join(&rel));
+            }
+        }
+    }
+    for ext in ["bbl", "bcf", "run.xml"] {
+        let src = output_dir.join("bibliografia").join(format!("{stem}.{ext}"));
+        copy_if_newer(&src, &live_dir.join(format!("{stem}.{ext}")));
     }
 }
 
 async fn run_tex_engine_pass(
     engine: &str,
-    parent_dir: &Path,
-    file_name: &std::ffi::OsStr,
+    work_dir: &Path,
+    out_dir: &Path,
+    search_dirs: &[&Path],
+    tex_arg: &str,
+    job_stem: Option<&str>,
     shell_escape: bool,
 ) -> Result<std::process::Output, String> {
+    let out_arg = format!("-output-directory={}", to_tex_slash_path(out_dir));
     let mut cmd = Command::new(engine);
-    cmd.current_dir(parent_dir)
+    hide_console_window(&mut cmd);
+    cmd.current_dir(work_dir)
         .kill_on_drop(true)
+        .env("TEXINPUTS", tex_env_search_paths(search_dirs))
         .args([
             "-synctex=-1",
             "-interaction=batchmode",
             "-file-line-error",
-            "-output-directory=.build",
+            &out_arg,
         ]);
+    if let Some(stem) = job_stem {
+        cmd.arg(format!("-jobname={stem}"));
+    }
     if shell_escape {
         cmd.arg("-shell-escape");
     }
-    cmd.arg(file_name)
-        .output()
-        .await
-        .map_err(|e| {
-            format!("Impossibile avviare {engine} ({e}). Verifica che TeX Live sia nel PATH.")
-        })
+    cmd.arg(tex_arg).output().await.map_err(|e| {
+        format!("Impossibile avviare {engine} ({e}). Verifica che TeX Live sia nel PATH.")
+    })
 }
 
 async fn run_bibtex_step(
-    parent_dir: &Path,
-    build_dir: &Path,
+    out_dir: &Path,
+    search_dirs: &[&Path],
     stem: &str,
 ) -> Result<std::process::Output, String> {
-    let parent_str = format!("{}:", parent_dir.display());
-    Command::new("bibtex")
-        .current_dir(build_dir)
+    let search = tex_env_search_paths(search_dirs);
+    let mut cmd = Command::new("bibtex");
+    hide_console_window(&mut cmd);
+    cmd.current_dir(out_dir)
         .kill_on_drop(true)
-        .env("BIBINPUTS", &parent_str)
-        .env("BSTINPUTS", &parent_str)
+        .env("BIBINPUTS", &search)
+        .env("BSTINPUTS", &search)
         .arg(stem)
         .output()
         .await
@@ -343,13 +609,20 @@ async fn run_bibtex_step(
         })
 }
 
-async fn run_biber_step(parent_dir: &Path, stem: &str) -> Result<std::process::Output, String> {
-    let parent_str = format!("{}:", parent_dir.display());
-    Command::new("biber")
-        .current_dir(parent_dir)
+async fn run_biber_step(
+    work_dir: &Path,
+    out_dir: &Path,
+    search_dirs: &[&Path],
+    stem: &str,
+) -> Result<std::process::Output, String> {
+    let search = tex_env_search_paths(search_dirs);
+    let out_str = to_tex_slash_path(out_dir);
+    let mut cmd = Command::new("biber");
+    hide_console_window(&mut cmd);
+    cmd.current_dir(work_dir)
         .kill_on_drop(true)
-        .env("BIBINPUTS", &parent_str)
-        .args(["--output-directory=.build", stem])
+        .env("BIBINPUTS", &search)
+        .args(["--output-directory", &out_str, stem])
         .output()
         .await
         .map_err(|e| {
@@ -363,13 +636,16 @@ async fn run_biber_step(parent_dir: &Path, stem: &str) -> Result<std::process::O
 }
 
 async fn run_makeglossaries_step(
-    parent_dir: &Path,
+    work_dir: &Path,
+    out_dir: &Path,
     stem: &str,
 ) -> Result<std::process::Output, String> {
-    Command::new("makeglossaries")
-        .current_dir(parent_dir)
+    let out_str = to_tex_slash_path(out_dir);
+    let mut cmd = Command::new("makeglossaries");
+    hide_console_window(&mut cmd);
+    cmd.current_dir(work_dir)
         .kill_on_drop(true)
-        .args(["-d", ".build", stem])
+        .args(["-d", &out_str, stem])
         .output()
         .await
         .map_err(|e| {
@@ -382,10 +658,11 @@ async fn run_makeglossaries_step(
         })
 }
 
-async fn run_makeindex_step(build_dir: &Path, stem: &str) -> Result<std::process::Output, String> {
+async fn run_makeindex_step(out_dir: &Path, stem: &str) -> Result<std::process::Output, String> {
     let idx_name = format!("{stem}.idx");
-    Command::new("makeindex")
-        .current_dir(build_dir)
+    let mut cmd = Command::new("makeindex");
+    hide_console_window(&mut cmd);
+    cmd.current_dir(out_dir)
         .kill_on_drop(true)
         .arg(&idx_name)
         .output()
@@ -401,24 +678,32 @@ async fn run_makeindex_step(build_dir: &Path, stem: &str) -> Result<std::process
 
 async fn run_latexmk_step(
     engine_flag: &str,
-    parent_dir: &Path,
-    file_name: &std::ffi::OsStr,
+    work_dir: &Path,
+    out_dir: &Path,
+    search_dirs: &[&Path],
+    tex_arg: &str,
     shell_escape: bool,
 ) -> Result<std::process::Output, String> {
+    let out_arg = format!("-outdir={}", to_tex_slash_path(out_dir));
+    let search = tex_env_search_paths(search_dirs);
     let mut cmd = Command::new("latexmk");
-    cmd.current_dir(parent_dir)
+    hide_console_window(&mut cmd);
+    cmd.current_dir(work_dir)
         .kill_on_drop(true)
+        .env("TEXINPUTS", &search)
+        .env("BIBINPUTS", &search)
+        .env("BSTINPUTS", &search)
         .args([
             engine_flag,
             "-synctex=-1",
             "-interaction=batchmode",
             "-file-line-error",
-            "-outdir=.build",
+            &out_arg,
         ]);
     if shell_escape {
         cmd.arg("-shell-escape");
     }
-    cmd.arg(file_name).output().await.map_err(|e| {
+    cmd.arg(tex_arg).output().await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             "latexmk non è installato nel sistema. Installalo con: sudo pacman -S texlive-binextra"
                 .to_string()
@@ -429,18 +714,23 @@ async fn run_latexmk_step(
 }
 
 async fn run_pdflatex_with_fmt(
-    parent_dir: &Path,
-    out_dir_arg: &str,
+    work_dir: &Path,
+    out_dir: &Path,
+    search_dirs: &[&Path],
+    fmt_dir: &Path,
     fmt_name: &str,
     stem: &str,
     body_tex_arg: &str,
 ) -> Result<std::process::Output, String> {
-    let out_arg = format!("-output-directory={out_dir_arg}");
-    let fmt_arg = format!("-fmt=.build/{fmt_name}");
+    let out_arg = format!("-output-directory={}", to_tex_slash_path(out_dir));
+    let fmt_arg = format!("-fmt={fmt_name}");
     let job_arg = format!("-jobname={stem}");
-    Command::new("pdflatex")
-        .current_dir(parent_dir)
+    let mut cmd = Command::new("pdflatex");
+    hide_console_window(&mut cmd);
+    cmd.current_dir(work_dir)
         .kill_on_drop(true)
+        .env("TEXINPUTS", tex_env_search_paths(search_dirs))
+        .env("TEXFORMATS", tex_env_search_path(fmt_dir))
         .args([
             "-synctex=-1",
             "-interaction=batchmode",
@@ -465,8 +755,9 @@ async fn run_pdflatex_live_pass(
 ) -> Result<std::process::Output, String> {
     let out_arg = format!("-output-directory={out_dir_arg}");
     let job_arg = format!("-jobname={stem}");
-    Command::new("pdflatex")
-        .current_dir(parent_dir)
+    let mut cmd = Command::new("pdflatex");
+    hide_console_window(&mut cmd);
+    cmd.current_dir(parent_dir)
         .kill_on_drop(true)
         .args([
             "-synctex=-1",
@@ -508,25 +799,21 @@ pub async fn compile_latex_live(
         .to_string_lossy()
         .to_string();
 
-    let build_dir = parent_dir.join(".build");
     let live_dir = live_dir_for(parent_dir);
-    tokio::fs::create_dir_all(&build_dir)
-        .await
-        .map_err(|e| format!("Impossibile creare .build: {e}"))?;
     tokio::fs::create_dir_all(&live_dir)
         .await
         .map_err(|e| format!("Impossibile creare directory live: {e}"))?;
 
     let canon_parent = std::fs::canonicalize(parent_dir).unwrap_or_else(|_| parent_dir.to_path_buf());
     let _ = tokio::fs::write(live_dir.join(".origin"), canon_parent.to_string_lossy().as_bytes()).await;
-    sync_aux_files_to_live(&build_dir, &live_dir, &stem);
+    sync_aux_files_to_live(parent_dir, &live_dir, &stem);
 
     let live_tex_path = live_dir.join(format!("{stem}.tex"));
-    let live_dir_str = live_dir.to_string_lossy().to_string();
-    let live_tex_str = live_tex_path.to_string_lossy().to_string();
+    let live_dir_str = to_tex_slash_path(&live_dir);
+    let live_tex_str = to_tex_slash_path(&live_tex_path);
 
     let fmt_opt = match split_preamble_and_body(&unsaved_contents) {
-        Some((preamble, body)) => match ensure_preamble_fmt(parent_dir, &build_dir, &preamble).await
+        Some((preamble, body)) => match ensure_preamble_fmt(parent_dir, &live_dir, &preamble).await
         {
             Some(fmt_name) => {
                 tokio::fs::write(&live_tex_path, body)
@@ -549,9 +836,19 @@ pub async fn compile_latex_live(
         }
     };
 
+    let search_dirs = [parent_dir];
     let mut output = match &fmt_opt {
         Some(fmt) => {
-            run_pdflatex_with_fmt(parent_dir, &live_dir_str, fmt, &stem, &live_tex_str).await?
+            run_pdflatex_with_fmt(
+                parent_dir,
+                &live_dir,
+                &search_dirs,
+                &live_dir,
+                fmt,
+                &stem,
+                &live_tex_str,
+            )
+            .await?
         }
         None => run_pdflatex_live_pass(parent_dir, &live_dir_str, &stem, &live_tex_str).await?,
     };
@@ -562,8 +859,16 @@ pub async fn compile_latex_live(
             if log_requests_rerun(&pass1_log) {
                 output = match &fmt_opt {
                     Some(fmt) => {
-                        run_pdflatex_with_fmt(parent_dir, &live_dir_str, fmt, &stem, &live_tex_str)
-                            .await?
+                        run_pdflatex_with_fmt(
+                            parent_dir,
+                            &live_dir,
+                            &search_dirs,
+                            &live_dir,
+                            fmt,
+                            &stem,
+                            &live_tex_str,
+                        )
+                        .await?
                     }
                     None => {
                         run_pdflatex_live_pass(parent_dir, &live_dir_str, &stem, &live_tex_str)
@@ -578,7 +883,7 @@ pub async fn compile_latex_live(
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     let live_pdf = live_dir.join(format!("{stem}.pdf"));
-    // Keep the compiled PDF staged in `live_dir` WITHOUT overwriting `.build/<stem>.pdf`
+    // Keep the compiled PDF staged in `live_dir` WITHOUT overwriting `<project_dir>/<stem>.pdf`
     // so the user's visible PDF stays untouched until they press Compila / Ctrl+B.
     let pdf_path = if output.status.success() && live_pdf.exists() {
         Some(live_pdf)
@@ -651,8 +956,8 @@ pub async fn compile_latex_live(
     })
 }
 
-/// Atomically promotes a staged live `.pdf`, `.synctex`, and auxiliary files (`.aux`, `.toc`, ...)
-/// from the live directory (`/dev/shm` or `.build/live/`) into the project's `.build/` folder.
+/// Atomically promotes a staged live `.pdf`, `.synctex`, `.log`, and auxiliary files (`.aux`, `.toc`, ...)
+/// from the live directory (`/dev/shm` or `<temp_dir>`) into `<project_dir>/output/<categoria>/`.
 pub fn promote_staged_live_result(mut result: CompileResult) -> Result<CompileResult, String> {
     if !result.success {
         return Ok(result);
@@ -667,47 +972,79 @@ pub fn promote_staged_live_result(mut result: CompileResult) -> Result<CompileRe
         return Ok(result);
     };
 
-    let build_dir = if let Ok(origin) = std::fs::read_to_string(live_dir.join(".origin")) {
+    let project_dir = if let Ok(origin) = std::fs::read_to_string(live_dir.join(".origin")) {
         let trimmed = origin.trim();
         if !trimmed.is_empty() {
-            PathBuf::from(trimmed).join(".build")
+            PathBuf::from(trimmed)
         } else {
             live_dir
                 .parent()
-                .ok_or_else(|| "Cartella .build non trovata".to_string())?
+                .ok_or_else(|| "Cartella del progetto non trovata".to_string())?
                 .to_path_buf()
         }
     } else {
         live_dir
             .parent()
-            .ok_or_else(|| "Cartella .build non trovata".to_string())?
+            .ok_or_else(|| "Cartella del progetto non trovata".to_string())?
             .to_path_buf()
     };
 
-    std::fs::create_dir_all(&build_dir)
-        .map_err(|e| format!("Impossibile creare .build per la promozione: {e}"))?;
+    let output_dir = project_dir.join("output");
+    let pdf_dir = output_dir.join("pdf");
+    std::fs::create_dir_all(&pdf_dir)
+        .map_err(|e| format!("Impossibile creare output/pdf per la promozione: {e}"))?;
 
-    let final_pdf = build_dir.join(file_name);
+    let final_pdf = pdf_dir.join(file_name);
     if live_pdf.exists() {
         move_file_atomic_or_copy(&live_pdf, &final_pdf)
             .map_err(|e| format!("Impossibile promuovere il PDF pre-compilato: {e}"))?;
-        if let Some(proj_dir) = build_dir.parent() {
-            mirror_pdf_to_project_dir(&final_pdf, proj_dir, file_name);
-        }
     }
 
     if let Some(stem) = live_pdf.file_stem().and_then(|s| s.to_str()) {
-        let live_synctex = live_dir.join(format!("{stem}.synctex"));
-        let final_synctex = build_dir.join(format!("{stem}.synctex"));
-        if live_synctex.exists() {
-            let _ = move_file_atomic_or_copy(&live_synctex, &final_synctex);
+        for syn_name in [format!("{stem}.synctex"), format!("{stem}.synctex.gz")] {
+            let live_syn = live_dir.join(&syn_name);
+            if live_syn.is_file() {
+                let syn_dir = output_dir.join("synctex");
+                let _ = std::fs::create_dir_all(&syn_dir);
+                let _ = move_file_atomic_or_copy(&live_syn, &syn_dir.join(&syn_name));
+            }
         }
+        let live_log = live_dir.join(format!("{stem}.log"));
+        if live_log.is_file() {
+            let log_dir = output_dir.join("log");
+            let _ = std::fs::create_dir_all(&log_dir);
+            let _ = std::fs::copy(&live_log, log_dir.join(format!("{stem}.log")));
+        }
+        let aux_dir = output_dir.join("ausiliari");
+        let _ = std::fs::create_dir_all(&aux_dir);
         for ext in AUX_EXTENSIONS {
             let live_aux = live_dir.join(format!("{stem}.{ext}"));
-            if live_aux.exists() {
-                let final_aux = build_dir.join(format!("{stem}.{ext}"));
-                let _ = std::fs::copy(&live_aux, &final_aux);
+            if live_aux.is_file() {
+                let _ = std::fs::copy(&live_aux, aux_dir.join(format!("{stem}.{ext}")));
             }
+        }
+        for rel_aux in {
+            let mut rels = Vec::new();
+            collect_files_recursive_sync(live_dir, live_dir, &mut rels);
+            rels
+        } {
+            if rel_aux.extension().and_then(|e| e.to_str()) == Some("aux") {
+                let dst = aux_dir.join(&rel_aux);
+                if let Some(p) = dst.parent() {
+                    let _ = std::fs::create_dir_all(p);
+                }
+                let _ = std::fs::copy(live_dir.join(&rel_aux), dst);
+            }
+        }
+        for ext in CLEANABLE_AUX_EXTENSIONS {
+            let old = project_dir.join(format!("{stem}.{ext}"));
+            if old.is_file() {
+                let _ = std::fs::remove_file(&old);
+            }
+        }
+        let old_pdf = project_dir.join(file_name);
+        if old_pdf.is_file() {
+            let _ = std::fs::remove_file(&old_pdf);
         }
     }
 
@@ -715,8 +1052,8 @@ pub fn promote_staged_live_result(mut result: CompileResult) -> Result<CompileRe
     Ok(result)
 }
 
-/// Promotes a staged live build into `.build/` and immediately populates metadata, SyncTeX
-/// target, and visible page textures (in ~15-25 ms using in-process Poppler+Cairo).
+/// Promotes a staged live build into `<project_dir>/output/` and immediately populates metadata,
+/// SyncTeX target, and visible page textures (in ~15-25 ms using in-process Poppler+Cairo).
 pub async fn finalize_promoted_live_result(
     result: CompileResult,
     tex_path: PathBuf,
@@ -867,9 +1204,13 @@ pub async fn compile_with_recipe(
     };
     let effective_recipe = effective_recipe_with_magic(&recipe, &magic);
 
-    let parent_dir = compile_tex_path
+    let tex_parent = compile_tex_path
         .parent()
         .ok_or_else(|| "Impossibile determinare la cartella del file".to_string())?;
+    let (project_dir, is_diff_build) = detect_output_project_root(tex_parent);
+    let output_dir = project_dir.join("output");
+    let live_dir = live_dir_for(&project_dir);
+    let stage_dir = live_dir.join("stage");
 
     let file_name = compile_tex_path
         .file_name()
@@ -881,10 +1222,19 @@ pub async fn compile_with_recipe(
         .to_string_lossy()
         .to_string();
 
-    let build_dir = parent_dir.join(".build");
-    tokio::fs::create_dir_all(&build_dir)
-        .await
-        .map_err(|e| format!("Impossibile creare la cartella .build: {e}"))?;
+    prepare_stage_dir(&project_dir, &output_dir, &stage_dir)
+        .map_err(|e| format!("Impossibile preparare l'area di compilazione: {e}"))?;
+
+    let tex_arg = if is_diff_build {
+        to_tex_slash_path(&compile_tex_path)
+    } else {
+        file_name.to_string_lossy().into_owned()
+    };
+    let search_dirs: Vec<&Path> = if is_diff_build {
+        vec![project_dir.as_path(), tex_parent]
+    } else {
+        vec![project_dir.as_path()]
+    };
 
     let steps = if effective_recipe.steps.is_empty() {
         vec![RecipeStep::PdfLatex]
@@ -897,13 +1247,13 @@ pub async fn compile_with_recipe(
             RecipeStep::PdfLatex | RecipeStep::LuaLatex | RecipeStep::XeLatex
         );
 
-    let body_tex_path = build_dir.join(format!("{stem}_body.tex"));
-    let body_tex_rel = format!(".build/{stem}_body.tex");
+    let body_tex_path = live_dir.join(format!("{stem}_body.tex"));
+    let body_tex_str = to_tex_slash_path(&body_tex_path);
     let mut prepared_fmt: Option<Option<String>> = None;
     let mut last_used_body_path: Option<PathBuf> = None;
 
-    let log_file = build_dir.join(format!("{stem}.log"));
-    let blg_file = build_dir.join(format!("{stem}.blg"));
+    let log_file = stage_dir.join(format!("{stem}.log"));
+    let blg_file = stage_dir.join(format!("{stem}.blg"));
     let mut diagnostics = Vec::new();
     let mut log_text = String::new();
     if compile_tex_path != tex_path {
@@ -939,15 +1289,28 @@ pub async fn compile_with_recipe(
                             .and_then(split_preamble_and_body)
                         {
                             Some((preamble, body)) => {
-                                match ensure_preamble_fmt(parent_dir, &build_dir, &preamble).await {
-                                    Some(fmt_name) => {
-                                        if tokio::fs::write(&body_tex_path, body).await.is_ok() {
-                                            Some(fmt_name)
-                                        } else {
-                                            None
+                                if !preamble_supports_fmt(&preamble)
+                                    || tokio::fs::create_dir_all(&live_dir).await.is_err()
+                                {
+                                    None
+                                } else {
+                                    let canon_parent = std::fs::canonicalize(&project_dir)
+                                        .unwrap_or_else(|_| project_dir.clone());
+                                    let _ = tokio::fs::write(
+                                        live_dir.join(".origin"),
+                                        canon_parent.to_string_lossy().as_bytes(),
+                                    )
+                                    .await;
+                                    match ensure_preamble_fmt(&project_dir, &live_dir, &preamble).await {
+                                        Some(fmt_name) => {
+                                            if tokio::fs::write(&body_tex_path, body).await.is_ok() {
+                                                Some(fmt_name)
+                                            } else {
+                                                None
+                                            }
                                         }
+                                        None => None,
                                     }
-                                    None => None,
                                 }
                             }
                             None => None,
@@ -960,11 +1323,29 @@ pub async fn compile_with_recipe(
                 let mut output = match &fmt_opt {
                     Some(fmt) => {
                         last_used_body_path = Some(body_tex_path.clone());
-                        run_pdflatex_with_fmt(parent_dir, ".build", fmt, &stem, &body_tex_rel).await?
+                        run_pdflatex_with_fmt(
+                            &project_dir,
+                            &stage_dir,
+                            &search_dirs,
+                            &live_dir,
+                            fmt,
+                            &stem,
+                            &body_tex_str,
+                        )
+                        .await?
                     }
                     None => {
                         last_used_body_path = None;
-                        run_tex_engine_pass("pdflatex", parent_dir, file_name, shell_escape).await?
+                        run_tex_engine_pass(
+                            "pdflatex",
+                            &project_dir,
+                            &stage_dir,
+                            &search_dirs,
+                            &tex_arg,
+                            None,
+                            shell_escape,
+                        )
+                        .await?
                     }
                 };
 
@@ -972,10 +1353,13 @@ pub async fn compile_with_recipe(
                     if let Some(pass1_log) = read_log_lossy(&log_file).await {
                         let mut did_auto_bib = false;
                         if log_needs_bibliography(&pass1_log, &stem) {
-                            let bcf_path = build_dir.join(format!("{stem}.bcf"));
-                            let aux_path = build_dir.join(format!("{stem}.aux"));
+                            let bcf_path = stage_dir.join(format!("{stem}.bcf"));
+                            let aux_path = stage_dir.join(format!("{stem}.aux"));
                             if bcf_path.exists() {
-                                if let Ok(bib_out) = run_biber_step(parent_dir, &stem).await {
+                                if let Ok(bib_out) =
+                                    run_biber_step(&project_dir, &stage_dir, &search_dirs, &stem)
+                                        .await
+                                {
                                     if bib_out.status.success() {
                                         log_text.push_str("=== [auto] Biber ===\n");
                                         did_auto_bib = true;
@@ -985,7 +1369,7 @@ pub async fn compile_with_recipe(
                                 if aux_txt.contains("\\bibdata{") && aux_txt.contains("\\citation{")
                                 {
                                     if let Ok(bib_out) =
-                                        run_bibtex_step(parent_dir, &build_dir, &stem).await
+                                        run_bibtex_step(&stage_dir, &search_dirs, &stem).await
                                     {
                                         if bib_out.status.success() {
                                             log_text.push_str("=== [auto] BibTeX ===\n");
@@ -1001,19 +1385,24 @@ pub async fn compile_with_recipe(
                                 output = match &fmt_opt {
                                     Some(fmt) => {
                                         run_pdflatex_with_fmt(
-                                            parent_dir,
-                                            ".build",
+                                            &project_dir,
+                                            &stage_dir,
+                                            &search_dirs,
+                                            &live_dir,
                                             fmt,
                                             &stem,
-                                            &body_tex_rel,
+                                            &body_tex_str,
                                         )
                                         .await?
                                     }
                                     None => {
                                         run_tex_engine_pass(
                                             "pdflatex",
-                                            parent_dir,
-                                            file_name,
+                                            &project_dir,
+                                            &stage_dir,
+                                            &search_dirs,
+                                            &tex_arg,
+                                            None,
                                             shell_escape,
                                         )
                                         .await?
@@ -1027,19 +1416,24 @@ pub async fn compile_with_recipe(
                             output = match &fmt_opt {
                                 Some(fmt) => {
                                     run_pdflatex_with_fmt(
-                                        parent_dir,
-                                        ".build",
+                                        &project_dir,
+                                        &stage_dir,
+                                        &search_dirs,
+                                        &live_dir,
                                         fmt,
                                         &stem,
-                                        &body_tex_rel,
+                                        &body_tex_str,
                                     )
                                     .await?
                                 }
                                 None => {
                                     run_tex_engine_pass(
                                         "pdflatex",
-                                        parent_dir,
-                                        file_name,
+                                        &project_dir,
+                                        &stage_dir,
+                                        &search_dirs,
+                                        &tex_arg,
+                                        None,
                                         shell_escape,
                                     )
                                     .await?
@@ -1077,14 +1471,29 @@ pub async fn compile_with_recipe(
                 } else {
                     "xelatex"
                 };
-                let mut output =
-                    run_tex_engine_pass(engine, parent_dir, file_name, shell_escape).await?;
+                let mut output = run_tex_engine_pass(
+                    engine,
+                    &project_dir,
+                    &stage_dir,
+                    &search_dirs,
+                    &tex_arg,
+                    None,
+                    shell_escape,
+                )
+                .await?;
                 if is_single_tex_pass && output.status.success() {
                     if let Some(pass1_log) = read_log_lossy(&log_file).await {
                         if log_requests_rerun(&pass1_log) {
-                            output =
-                                run_tex_engine_pass(engine, parent_dir, file_name, shell_escape)
-                                    .await?;
+                            output = run_tex_engine_pass(
+                                engine,
+                                &project_dir,
+                                &stage_dir,
+                                &search_dirs,
+                                &tex_arg,
+                                None,
+                                shell_escape,
+                            )
+                            .await?;
                         }
                     }
                 }
@@ -1111,7 +1520,7 @@ pub async fn compile_with_recipe(
                 }
             }
             RecipeStep::BibTex => {
-                let output = run_bibtex_step(parent_dir, &build_dir, &stem).await?;
+                let output = run_bibtex_step(&stage_dir, &search_dirs, &stem).await?;
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let blg_raw = read_log_lossy(&blg_file).await.unwrap_or_default();
@@ -1156,7 +1565,8 @@ pub async fn compile_with_recipe(
                 }
             }
             RecipeStep::Biber => {
-                let output = run_biber_step(parent_dir, &stem).await?;
+                let output =
+                    run_biber_step(&project_dir, &stage_dir, &search_dirs, &stem).await?;
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 if !stdout.trim().is_empty() {
@@ -1192,7 +1602,7 @@ pub async fn compile_with_recipe(
                 }
             }
             RecipeStep::MakeGlossaries => {
-                let output = run_makeglossaries_step(parent_dir, &stem).await?;
+                let output = run_makeglossaries_step(&project_dir, &stage_dir, &stem).await?;
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 if !stdout.trim().is_empty() {
@@ -1224,12 +1634,12 @@ pub async fn compile_with_recipe(
                 }
             }
             RecipeStep::MakeIndex => {
-                let idx_path = build_dir.join(format!("{stem}.idx"));
+                let idx_path = stage_dir.join(format!("{stem}.idx"));
                 if !idx_path.exists() {
                     log_text.push_str("(Nessun file .idx trovato — passo MakeIndex saltato.)\n");
                     continue;
                 }
-                let output = run_makeindex_step(&build_dir, &stem).await?;
+                let output = run_makeindex_step(&stage_dir, &stem).await?;
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 if !stdout.trim().is_empty() {
@@ -1263,8 +1673,15 @@ pub async fn compile_with_recipe(
                     RecipeStep::LatexMkXe => "-xelatex",
                     _ => "-pdf",
                 };
-                let output =
-                    run_latexmk_step(flag, parent_dir, file_name, shell_escape).await?;
+                let output = run_latexmk_step(
+                    flag,
+                    &project_dir,
+                    &stage_dir,
+                    &search_dirs,
+                    &tex_arg,
+                    shell_escape,
+                )
+                .await?;
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 if output.status.success() {
@@ -1289,6 +1706,20 @@ pub async fn compile_with_recipe(
         }
     }
 
+    if pipeline_ok {
+        organize_stage_into_output_dirs(&project_dir, &stage_dir, &output_dir, &stem);
+    } else {
+        for log_name in [format!("{stem}.log"), format!("{stem}.blg")] {
+            let staged_log = stage_dir.join(&log_name);
+            if staged_log.is_file() {
+                let log_dir = output_dir.join("log");
+                let _ = std::fs::create_dir_all(&log_dir);
+                let _ = move_file_atomic_or_copy(&staged_log, &log_dir.join(&log_name));
+            }
+        }
+    }
+    let _ = tokio::fs::remove_dir_all(&stage_dir).await;
+
     let sync_tex_path: &Path = if compile_tex_path != tex_path {
         tex_path.as_path()
     } else if let Some(ref body) = last_used_body_path {
@@ -1297,11 +1728,8 @@ pub async fn compile_with_recipe(
         compile_tex_path.as_path()
     };
 
-    let pdf_candidate = build_dir.join(format!("{stem}.pdf"));
+    let pdf_candidate = output_dir.join("pdf").join(format!("{stem}.pdf"));
     let pdf_path = if pipeline_ok && pdf_candidate.exists() {
-        if let Some(pdf_fname) = pdf_candidate.file_name() {
-            mirror_pdf_to_project_dir(&pdf_candidate, parent_dir, pdf_fname);
-        }
         Some(pdf_candidate)
     } else {
         None
@@ -1369,7 +1797,7 @@ pub async fn compile_with_recipe(
 }
 
 /// Forward SyncTeX search: maps a 1-based line in `tex_path` to `(page, v_ratio)` in `pdf_path`.
-/// Automatically checks `.build/<stem>_body.tex` and `.build/live/<file_name>` when compiled
+/// Automatically checks staged live/body files in `live_dir_for(parent)` when compiled
 /// with precompiled `.fmt` or shadow live compilation.
 pub async fn synctex_forward_search(
     tex_path: &Path,
@@ -1384,8 +1812,9 @@ pub async fn synctex_forward_search(
         return Some(hit);
     }
     let parent = tex_path.parent()?;
+    let live_dir = live_dir_for(parent);
     if let Some(stem) = tex_path.file_stem().and_then(|s| s.to_str()) {
-        let body_candidate = parent.join(".build").join(format!("{stem}_body.tex"));
+        let body_candidate = live_dir.join(format!("{stem}_body.tex"));
         if body_candidate != tex_path && body_candidate.exists() {
             if let Some(hit) = synctex_forward_query(
                 &body_candidate,
@@ -1401,22 +1830,8 @@ pub async fn synctex_forward_search(
         }
     }
     let file_name = tex_path.file_name()?;
-    let shm_live_candidate = live_dir_for(parent).join(file_name);
-    if shm_live_candidate != tex_path && shm_live_candidate.exists() {
-        if let Some(hit) = synctex_forward_query(
-            &shm_live_candidate,
-            pdf_path,
-            line_1based,
-            page_height_pts,
-            total_pages,
-        )
-        .await
-        {
-            return Some(hit);
-        }
-    }
-    let live_candidate = parent.join(".build").join("live").join(file_name);
-    if live_candidate != tex_path && live_candidate != shm_live_candidate && live_candidate.exists() {
+    let live_candidate = live_dir.join(file_name);
+    if live_candidate != tex_path && live_candidate.exists() {
         return synctex_forward_query(
             &live_candidate,
             pdf_path,
@@ -1436,19 +1851,21 @@ async fn synctex_forward_query(
     page_height_pts: f32,
     total_pages: usize,
 ) -> Option<PdfSyncTarget> {
-    let parent = pdf_path
-        .parent()
-        .and_then(|p| p.parent())
-        .or_else(|| tex_path.parent())?;
+    let (proj_opt, syn_dir_opt) = pdf_project_and_synctex_dirs(pdf_path);
+    let parent = proj_opt.as_deref().or_else(|| tex_path.parent())?;
     let input_spec = format!("{}:1:{}", line_1based.max(1), tex_path.display());
 
-    let out = Command::new("synctex")
-        .current_dir(parent)
+    let mut cmd = Command::new("synctex");
+    hide_console_window(&mut cmd);
+    cmd.current_dir(parent)
         .args(["view", "-i", &input_spec, "-o"])
-        .arg(pdf_path)
-        .output()
-        .await
-        .ok()?;
+        .arg(pdf_path);
+    if let Some(ref syn_dir) = syn_dir_opt {
+        if syn_dir.is_dir() {
+            cmd.arg("-d").arg(syn_dir);
+        }
+    }
+    let out = cmd.output().await.ok()?;
 
     if !out.status.success() {
         return None;
@@ -1485,8 +1902,8 @@ async fn synctex_forward_query(
     Some(PdfSyncTarget { page, v_ratio })
 }
 
-/// Maps shadow `.build/live/<name>.tex` or `.build/<stem>_body.tex` paths back to the real
-/// `<project_dir>/<stem>.tex` file so reverse SyncTeX always opens the user's source file.
+/// Maps shadow live/body or isolated wrapper `.tex` paths back to the real source `.tex` file
+/// so reverse SyncTeX always opens the user's actual file.
 fn remap_live_tex_path(path: PathBuf) -> PathBuf {
     let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
         return path;
@@ -1495,41 +1912,28 @@ fn remap_live_tex_path(path: PathBuf) -> PathBuf {
         return path;
     };
 
-    // Case 0: RAM-disk live directory `/dev/shm/feathertex_live_<hash>/<name>.tex` with `.origin`
-    if let Ok(origin) = std::fs::read_to_string(parent.join(".origin")) {
-        let trimmed = origin.trim();
+    if let Ok(target) = std::fs::read_to_string(parent.join(".iso_target")) {
+        let trimmed = target.trim();
         if !trimmed.is_empty() {
-            let candidate = Path::new(trimmed).join(file_name);
+            let candidate = PathBuf::from(trimmed);
             if candidate.exists() {
                 return candidate;
             }
         }
     }
 
-    let parent_name = parent.file_name().and_then(|n| n.to_str());
-
-    // Case 1: `<project>/.build/live/<name>.tex`
-    if parent_name == Some("live") {
-        if let Some(build_dir) = parent.parent() {
-            if build_dir.file_name().and_then(|n| n.to_str()) == Some(".build") {
-                if let Some(project_dir) = build_dir.parent() {
-                    let candidate = project_dir.join(file_name);
-                    if candidate.exists() {
-                        return candidate;
-                    }
-                }
-            }
-        }
-    }
-
-    // Case 2: `<project>/.build/<stem>_body.tex`
-    if parent_name == Some(".build") {
-        if let Some(stem) = file_name.strip_suffix("_body.tex") {
-            if let Some(project_dir) = parent.parent() {
-                let candidate = project_dir.join(format!("{stem}.tex"));
-                if candidate.exists() {
-                    return candidate;
-                }
+    // Shadow live/cache directory (`/dev/shm/feathertex_live_...` or temp dir) with `.origin`
+    if let Ok(origin) = std::fs::read_to_string(parent.join(".origin")) {
+        let trimmed = origin.trim();
+        if !trimmed.is_empty() {
+            let mapped_name = if let Some(stem) = file_name.strip_suffix("_body.tex") {
+                format!("{stem}.tex")
+            } else {
+                file_name.to_string()
+            };
+            let candidate = Path::new(trimmed).join(&mapped_name);
+            if candidate.exists() {
+                return candidate;
             }
         }
     }
@@ -1553,12 +1957,20 @@ pub async fn synctex_reverse_search(
         pdf_path.display()
     );
 
+    let (proj_opt, syn_dir_opt) = pdf_project_and_synctex_dirs(pdf_path);
     let mut cmd = Command::new("synctex");
-    if let Some(work_dir) = pdf_path.parent().and_then(|p| p.parent()) {
+    hide_console_window(&mut cmd);
+    if let Some(ref work_dir) = proj_opt {
         cmd.current_dir(work_dir);
     }
+    cmd.args(["edit", "-o", &spec]);
+    if let Some(ref syn_dir) = syn_dir_opt {
+        if syn_dir.is_dir() {
+            cmd.arg("-d").arg(syn_dir);
+        }
+    }
 
-    let out = cmd.args(["edit", "-o", &spec]).output().await.ok()?;
+    let out = cmd.output().await.ok()?;
     if !out.status.success() {
         return None;
     }
@@ -1965,16 +2377,18 @@ async fn render_single_page(
     target_width_px: u32,
     target_height_px: u32,
 ) -> Result<RenderedPage, String> {
-    let target_w = target_width_px.clamp(240, 2800);
-    let target_h = target_height_px.clamp(240, 4000);
+    let target_w = target_width_px.clamp(240, 3600);
+    let target_h = target_height_px.clamp(120, 4800);
     let w_str = target_w.to_string();
     let h_str = target_h.to_string();
     let p_str = page_number.to_string();
 
-    // Primary: `pdftocairo -png -singlefile` (Cairo + FreeType, exact 1:1 physical pixels,
+    // Primary: `pdftocairo -png -singlefile` (Cairo + FreeType, exact physical pixels,
     // zero temp files). Note: intentionally uses default Cairo antialiasing (never `-antialias best`,
     // which triggers a Poppler/Cairo bug on Type 1 `cm-super` fonts).
-    if let Ok(output) = Command::new("pdftocairo")
+    let mut cairo_cmd = Command::new("pdftocairo");
+    hide_console_window(&mut cairo_cmd);
+    if let Ok(output) = cairo_cmd
         .args([
             "-png",
             "-singlefile",
@@ -2000,8 +2414,11 @@ async fn render_single_page(
         }
     }
 
-    // Fallback: `pdftoppm` raw PPM P6 via stdout.
-    let output = Command::new("pdftoppm")
+    // Fallback: `pdftoppm` raw PPM P6 via stdout (`-thinlinemode shape` improves crisp vector strokes
+    // like TikZ/tikz-cd arrows on Windows/Poppler Splash; falls back cleanly if unsupported).
+    let mut ppm_cmd = Command::new("pdftoppm");
+    hide_console_window(&mut ppm_cmd);
+    let primary_ppm = ppm_cmd
         .args([
             "-scale-to-x",
             &w_str,
@@ -2011,6 +2428,8 @@ async fn render_single_page(
             "yes",
             "-aaVector",
             "yes",
+            "-thinlinemode",
+            "shape",
             "-f",
             &p_str,
             "-l",
@@ -2018,11 +2437,37 @@ async fn render_single_page(
         ])
         .arg(&pdf_path)
         .output()
-        .await
-        .map_err(|_| {
-            "Anteprima interna non disponibile: installa 'poppler' (pdftocairo/pdftoppm) oppure usa 'Esterno'."
-                .to_string()
-        })?;
+        .await;
+
+    let output = match primary_ppm {
+        Ok(out) if out.status.success() => out,
+        _ => {
+            let mut fallback_ppm = Command::new("pdftoppm");
+            hide_console_window(&mut fallback_ppm);
+            fallback_ppm
+                .args([
+                    "-scale-to-x",
+                    &w_str,
+                    "-scale-to-y",
+                    &h_str,
+                    "-aa",
+                    "yes",
+                    "-aaVector",
+                    "yes",
+                    "-f",
+                    &p_str,
+                    "-l",
+                    &p_str,
+                ])
+                .arg(&pdf_path)
+                .output()
+                .await
+                .map_err(|_| {
+                    "Anteprima interna non disponibile: installa 'poppler' (pdftocairo/pdftoppm) oppure usa 'Esterno'."
+                        .to_string()
+                })?
+        }
+    };
 
     if !output.status.success() {
         return Err(format!(
@@ -2154,7 +2599,9 @@ async fn pdf_metadata(pdf_path: &Path) -> Result<(usize, f32, f32, f32), String>
         }
     }
 
-    let out = Command::new("pdfinfo")
+    let mut info_cmd = Command::new("pdfinfo");
+    hide_console_window(&mut info_cmd);
+    let out = info_cmd
         .arg(pdf_path)
         .output()
         .await
@@ -2272,36 +2719,33 @@ fn diagnose_missing_packages(log: &str) -> Option<String> {
 }
 
 pub fn open_pdf_external(pdf_path: &Path) {
-    let preferred = user_facing_pdf_path(pdf_path);
-    let target = if preferred.exists() {
-        preferred.as_path()
-    } else {
-        pdf_path
-    };
-
     #[cfg(target_os = "linux")]
-    let _ = std::process::Command::new("xdg-open").arg(target).spawn();
+    let _ = std::process::Command::new("xdg-open").arg(pdf_path).spawn();
 
     #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(target).spawn();
+    let _ = std::process::Command::new("open").arg(pdf_path).spawn();
 
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("rundll32.exe")
-        .arg("url.dll,FileProtocolHandler")
-        .arg(target)
-        .spawn();
+    {
+        let mut cmd = std::process::Command::new("rundll32.exe");
+        hide_std_console_window(&mut cmd);
+        let _ = cmd.arg("url.dll,FileProtocolHandler").arg(pdf_path).spawn();
+    }
 }
 
-/// Returns `<project_dir>/<name>.pdf` when given `.build/<name>.pdf`.
-pub fn user_facing_pdf_path(pdf_path: &Path) -> PathBuf {
-    if let (Some(fname), Some(build_dir)) = (pdf_path.file_name(), pdf_path.parent()) {
-        if build_dir.file_name().and_then(|n| n.to_str()) == Some(".build") {
-            if let Some(proj_dir) = build_dir.parent() {
-                return proj_dir.join(fname);
-            }
-        }
+pub fn open_url_external(url: &str) {
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(url).spawn();
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = std::process::Command::new("rundll32.exe");
+        hide_std_console_window(&mut cmd);
+        let _ = cmd.arg("url.dll,FileProtocolHandler").arg(url).spawn();
     }
-    pdf_path.to_path_buf()
 }
 
 pub async fn export_pdf_as(
@@ -2324,12 +2768,9 @@ pub async fn export_pdf_as(
         .ok_or_else(|| "Esportazione PDF annullata".to_string())?;
     let dest = handle.path().to_path_buf();
 
-    let preferred = user_facing_pdf_path(&source_pdf);
-    let src = if preferred.exists() { preferred } else { source_pdf };
-
     tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let bytes =
-            std::fs::read(&src).map_err(|e| format!("Impossibile leggere il PDF: {e}"))?;
+        let bytes = std::fs::read(&source_pdf)
+            .map_err(|e| format!("Impossibile leggere il PDF: {e}"))?;
         crate::document::write_file_atomic_sync(&dest, &bytes)
             .map_err(|e| format!("Errore salvataggio PDF: {e}"))?;
         Ok(())
@@ -2340,29 +2781,683 @@ pub async fn export_pdf_as(
     Ok(handle.path().to_path_buf())
 }
 
+const CLEANABLE_AUX_EXTENSIONS: &[&str] = &[
+    "aux",
+    "log",
+    "bbl",
+    "blg",
+    "bcf",
+    "run.xml",
+    "toc",
+    "out",
+    "lof",
+    "lot",
+    "nav",
+    "snm",
+    "vrb",
+    "fdb_latexmk",
+    "fls",
+    "synctex.gz",
+    "synctex",
+    "glo",
+    "gls",
+    "glg",
+    "ist",
+    "acn",
+    "acr",
+    "alg",
+    "idx",
+    "ind",
+    "ilg",
+];
+
 pub async fn clean_build_dir(tex_path: PathBuf) -> Result<String, String> {
-    let parent_dir = tex_path
+    let raw_parent = tex_path
         .parent()
         .ok_or_else(|| "Cartella del file non trovata".to_string())?;
-    let build_dir = parent_dir.join(".build");
+    let (project_dir, _) = detect_output_project_root(raw_parent);
+    let mut removed = 0usize;
 
-    if build_dir.is_symlink() {
-        return Err(
-            "La cartella .build è un collegamento simbolico: pulizia annullata per sicurezza."
-                .to_string(),
-        );
+    let output_dir = project_dir.join("output");
+    for sub in ["ausiliari", "log", "bibliografia", "synctex", "diff"] {
+        let p = output_dir.join(sub);
+        if p.is_dir() && !p.is_symlink() && tokio::fs::remove_dir_all(&p).await.is_ok() {
+            removed += 1;
+        }
     }
 
-    if build_dir.exists() {
-        tokio::fs::remove_dir_all(&build_dir)
-            .await
-            .map_err(|e| format!("Errore pulizia .build: {e}"))?;
+    if let Some(stem) = tex_path.file_stem().and_then(|s| s.to_str()) {
+        for ext in CLEANABLE_AUX_EXTENSIONS {
+            let candidate = project_dir.join(format!("{stem}.{ext}"));
+            if candidate.is_file() && tokio::fs::remove_file(&candidate).await.is_ok() {
+                removed += 1;
+            }
+        }
     }
-    let shm_live = live_dir_for(parent_dir);
-    if shm_live != build_dir.join("live") && shm_live.exists() {
+
+    let legacy_build = project_dir.join(".build");
+    if legacy_build.is_dir() && !legacy_build.is_symlink() {
+        let _ = tokio::fs::remove_dir_all(&legacy_build).await;
+    }
+
+    let shm_live = live_dir_for(&project_dir);
+    if shm_live.exists() {
         let _ = tokio::fs::remove_dir_all(&shm_live).await;
     }
-    Ok("Cartella .build pulita".to_string())
+
+    if removed > 0 {
+        Ok("File ausiliari, log e diff puliti (PDF conservato)".to_string())
+    } else {
+        Ok("File ausiliari puliti".to_string())
+    }
+}
+
+fn source_has_documentclass(src: &str) -> bool {
+    src.lines().any(|raw| {
+        let code = raw.split('%').next().unwrap_or("");
+        code.contains("\\documentclass")
+    })
+}
+
+fn source_requires_lua_or_xe(src: &str) -> bool {
+    src.lines().any(|raw| {
+        let code = raw.split('%').next().unwrap_or("");
+        code.contains("fontspec") || code.contains("unicode-math") || code.contains("luacode")
+    })
+}
+
+fn sanitize_isolated_stem(stem: &str) -> String {
+    let mut out: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if out.is_empty() {
+        out.push_str("isolato");
+    }
+    out
+}
+
+fn paths_match_loose(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
+async fn read_source_from_buffers_or_disk(
+    path: &Path,
+    open_buffers: &[(PathBuf, String)],
+) -> Option<String> {
+    if let Some((_, text)) = open_buffers
+        .iter()
+        .find(|(p, _)| paths_match_loose(p, path))
+    {
+        return Some(text.clone());
+    }
+    read_log_lossy(path).await
+}
+
+async fn resolve_isolated_master(
+    tex_path: &Path,
+    unsaved_contents: &str,
+    master_override: Option<&Path>,
+    open_buffers: &[(PathBuf, String)],
+) -> Option<(PathBuf, String)> {
+    let parent_dir = tex_path.parent()?;
+    let stem = tex_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let file_name_str = tex_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+
+    let origin_magic = parse_magic_comments(unsaved_contents);
+    if origin_magic.root.is_some() {
+        let resolved = resolve_root_path(tex_path, &origin_magic);
+        if resolved != tex_path {
+            if let Some(src) = read_source_from_buffers_or_disk(&resolved, open_buffers).await {
+                if source_has_documentclass(&src) {
+                    return Some((resolved, src));
+                }
+            }
+        }
+    }
+
+    if let Some(master) = master_override {
+        if !paths_match_loose(master, tex_path) {
+            if let Some(src) = read_source_from_buffers_or_disk(master, open_buffers).await {
+                if source_has_documentclass(&src) {
+                    return Some((master.to_path_buf(), src));
+                }
+            }
+        }
+    }
+
+    // Check open tabs sharing the project tree before hitting disk.
+    let canon_parent =
+        std::fs::canonicalize(parent_dir).unwrap_or_else(|_| parent_dir.to_path_buf());
+    let mut best_open: Option<(u8, PathBuf, String)> = None;
+    for (buf_path, buf_text) in open_buffers {
+        if paths_match_loose(buf_path, tex_path) || !source_has_documentclass(buf_text) {
+            continue;
+        }
+        let Some(buf_dir) = buf_path.parent() else {
+            continue;
+        };
+        let canon_buf_dir =
+            std::fs::canonicalize(buf_dir).unwrap_or_else(|_| buf_dir.to_path_buf());
+        let same_tree = canon_parent.starts_with(&canon_buf_dir) || parent_dir.starts_with(buf_dir);
+        let mentions_me = (!stem.is_empty() && buf_text.contains(stem))
+            || (!file_name_str.is_empty() && buf_text.contains(file_name_str));
+        let is_common_name = buf_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| {
+                matches!(
+                    n.to_ascii_lowercase().as_str(),
+                    "main.tex" | "master.tex" | "thesis.tex" | "tesi.tex"
+                )
+            });
+        let score = if same_tree && mentions_me {
+            4
+        } else if same_tree && is_common_name {
+            3
+        } else if same_tree {
+            2
+        } else if is_common_name || mentions_me {
+            1
+        } else {
+            0
+        };
+        if score > 0 && best_open.as_ref().is_none_or(|(best_s, _, _)| score > *best_s) {
+            best_open = Some((score, buf_path.clone(), buf_text.clone()));
+        }
+    }
+    if let Some((_, p, src)) = best_open {
+        return Some((p, src));
+    }
+
+    // Walk up up to 4 levels on disk checking standard root names first, then any `.tex` with `\documentclass`.
+    for anc in parent_dir.ancestors().take(4) {
+        for common in ["main.tex", "master.tex", "thesis.tex", "tesi.tex"] {
+            let candidate = anc.join(common);
+            if candidate.is_file() && !paths_match_loose(&candidate, tex_path) {
+                if let Some(src) = read_log_lossy(&candidate).await {
+                    if source_has_documentclass(&src) {
+                        return Some((candidate, src));
+                    }
+                }
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(anc) {
+            let mut candidates: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.is_file()
+                        && p.extension()
+                            .and_then(|e| e.to_str())
+                            .is_some_and(|e| e.eq_ignore_ascii_case("tex"))
+                        && !paths_match_loose(p, tex_path)
+                })
+                .collect();
+            candidates.sort();
+            let mut first_with_docclass: Option<(PathBuf, String)> = None;
+            for cand in candidates {
+                if let Some(src) = read_log_lossy(&cand).await {
+                    if source_has_documentclass(&src) {
+                        if !stem.is_empty() && src.contains(stem) {
+                            return Some((cand, src));
+                        }
+                        if first_with_docclass.is_none() {
+                            first_with_docclass = Some((cand, src));
+                        }
+                    }
+                }
+            }
+            if let Some(found) = first_with_docclass {
+                return Some(found);
+            }
+        }
+    }
+
+    None
+}
+
+/// Compiles `tex_path` in isolation inside a temporary directory using the active `recipe`
+/// (borrowing the preamble from the resolved master root via `\input{"<tex_path>"}` when
+/// `\documentclass` is missing) so the user stays on their exact real file with SyncTeX intact
+/// and without touching the project's `output/` or auxiliary files.
+pub async fn compile_isolated_file(
+    tex_path: PathBuf,
+    unsaved_contents: String,
+    master_override: Option<PathBuf>,
+    recipe: CompileRecipe,
+    shell_escape: bool,
+    open_buffers: Vec<(PathBuf, String)>,
+    sync_line: usize,
+    fallback_page: usize,
+    target_width_px: u32,
+) -> Result<CompileResult, String> {
+    let started = Instant::now();
+    let parent_dir = tex_path
+        .parent()
+        .ok_or_else(|| "Impossibile determinare la cartella del file".to_string())?;
+    let stem = tex_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("isolato");
+
+    let canon_tex = std::fs::canonicalize(&tex_path).unwrap_or_else(|_| tex_path.clone());
+    let has_docclass = source_has_documentclass(&unsaved_contents);
+    let real_file_exists = canon_tex.is_file();
+    let real_input_slash = to_tex_slash_path(&canon_tex);
+
+    let (wrapper_src_opt, master_path_opt, magic_src, check_source) = if has_docclass {
+        let wrapper = if real_file_exists {
+            None
+        } else {
+            Some(unsaved_contents.clone())
+        };
+        (
+            wrapper,
+            None,
+            unsaved_contents.clone(),
+            unsaved_contents.clone(),
+        )
+    } else {
+        let fallback_preamble = "\\documentclass[11pt,a4paper]{article}\n\\usepackage[utf8]{inputenc}\n\\usepackage[T1]{fontenc}\n\\usepackage{amsmath,amssymb,graphicx}".to_string();
+        let master_info = resolve_isolated_master(
+            &tex_path,
+            &unsaved_contents,
+            master_override.as_deref(),
+            &open_buffers,
+        )
+        .await;
+        let (preamble, master_p, master_raw) = match master_info {
+            Some((mp, msrc)) => {
+                let pre = split_preamble_and_body(&msrc)
+                    .map(|(p, _)| p)
+                    .unwrap_or(fallback_preamble);
+                (pre, Some(mp), msrc)
+            }
+            None => (fallback_preamble, None, String::new()),
+        };
+        let combined = if real_file_exists {
+            format!("{preamble}\n\\begin{{document}}\n\\input{{\"{real_input_slash}\"}}\n\\end{{document}}\n")
+        } else {
+            format!("{preamble}\n\\begin{{document}}\n{unsaved_contents}\n\\end{{document}}\n")
+        };
+        let mut check_buf = preamble;
+        check_buf.push('\n');
+        check_buf.push_str(&unsaved_contents);
+        let mut magic_buf = unsaved_contents.clone();
+        if !master_raw.is_empty() {
+            magic_buf.push('\n');
+            magic_buf.push_str(&master_raw);
+        }
+        (Some(combined), master_p, magic_buf, check_buf)
+    };
+
+    let work_dir = master_path_opt
+        .as_deref()
+        .and_then(|p| p.parent())
+        .unwrap_or(parent_dir)
+        .to_path_buf();
+    let search_dirs: Vec<&Path> = if work_dir != parent_dir {
+        vec![work_dir.as_path(), parent_dir]
+    } else {
+        vec![work_dir.as_path()]
+    };
+
+    let magic = parse_magic_comments(&magic_src);
+    let effective_recipe = effective_recipe_with_magic(&recipe, &magic);
+    let needs_unicode_engine = source_requires_lua_or_xe(&check_source);
+    let mut steps = if effective_recipe.steps.is_empty() {
+        vec![RecipeStep::PdfLatex]
+    } else {
+        effective_recipe.steps.clone()
+    };
+    if needs_unicode_engine {
+        for s in &mut steps {
+            *s = match *s {
+                RecipeStep::PdfLatex => RecipeStep::LuaLatex,
+                RecipeStep::LatexMkPdf => RecipeStep::LatexMkLua,
+                other => other,
+            };
+        }
+    }
+    let is_single_tex_pass = steps.len() == 1
+        && matches!(
+            steps[0],
+            RecipeStep::PdfLatex | RecipeStep::LuaLatex | RecipeStep::XeLatex
+        );
+
+    let hash = fnv1a_64(canon_tex.to_string_lossy().as_bytes());
+    let iso_dir = std::env::temp_dir().join(format!("feathertex_iso_{hash:016x}"));
+    if iso_dir.exists() {
+        let _ = tokio::fs::remove_dir_all(&iso_dir).await;
+    }
+    tokio::fs::create_dir_all(&iso_dir)
+        .await
+        .map_err(|e| format!("Impossibile creare directory isolata: {e}"))?;
+
+    if real_file_exists {
+        let _ = tokio::fs::write(
+            iso_dir.join(".iso_target"),
+            canon_tex.to_string_lossy().as_bytes(),
+        )
+        .await;
+    }
+
+    let iso_stem = format!("{}_iso", sanitize_isolated_stem(stem));
+    let iso_tex_arg = match &wrapper_src_opt {
+        Some(wrapper_src) => {
+            let iso_tex = iso_dir.join(format!("{iso_stem}.tex"));
+            tokio::fs::write(&iso_tex, wrapper_src.as_bytes())
+                .await
+                .map_err(|e| format!("Impossibile scrivere file isolato: {e}"))?;
+            to_tex_slash_path(&iso_tex)
+        }
+        None => real_input_slash.clone(),
+    };
+
+    let log_file = iso_dir.join(format!("{iso_stem}.log"));
+    let blg_file = iso_dir.join(format!("{iso_stem}.blg"));
+    let mut diagnostics = Vec::new();
+    let mut log_text = format!(
+        "=== Anteprima isolata ({}): {} ===\n",
+        effective_recipe.name,
+        canon_tex.display()
+    );
+    if let Some(ref mp) = master_path_opt {
+        log_text.push_str(&format!("=== Preambolo da: {} ===\n", mp.display()));
+    }
+
+    let mut pipeline_ok = true;
+    let total_steps = steps.len();
+
+    for (idx, step) in steps.iter().copied().enumerate() {
+        log_text.push_str(&format!(
+            "=== [{}/{}] {} ===\n",
+            idx + 1,
+            total_steps,
+            step.label()
+        ));
+
+        match step {
+            RecipeStep::PdfLatex | RecipeStep::LuaLatex | RecipeStep::XeLatex => {
+                let engine = match step {
+                    RecipeStep::LuaLatex => "lualatex",
+                    RecipeStep::XeLatex => "xelatex",
+                    _ => "pdflatex",
+                };
+                let mut output = run_tex_engine_pass(
+                    engine,
+                    &work_dir,
+                    &iso_dir,
+                    &search_dirs,
+                    &iso_tex_arg,
+                    Some(&iso_stem),
+                    shell_escape,
+                )
+                .await?;
+                if is_single_tex_pass && output.status.success() {
+                    if let Some(pass1_log) = read_log_lossy(&log_file).await {
+                        if log_requests_rerun(&pass1_log) {
+                            output = run_tex_engine_pass(
+                                engine,
+                                &work_dir,
+                                &iso_dir,
+                                &search_dirs,
+                                &iso_tex_arg,
+                                Some(&iso_stem),
+                                shell_escape,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if output.status.success() {
+                    if !stdout.trim().is_empty() {
+                        log_text.push_str(stdout.trim());
+                        log_text.push('\n');
+                    }
+                } else {
+                    let raw_log = read_log_lossy(&log_file).await;
+                    append_tex_failure_logs(
+                        &mut log_text,
+                        engine,
+                        raw_log.as_deref(),
+                        &stdout,
+                        &stderr,
+                        &mut diagnostics,
+                    );
+                    pipeline_ok = false;
+                    break;
+                }
+            }
+            RecipeStep::BibTex => {
+                let output = run_bibtex_step(&iso_dir, &search_dirs, &iso_stem).await?;
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let blg_raw = read_log_lossy(&blg_file).await.unwrap_or_default();
+                let combined_bib = if stdout.trim().is_empty() {
+                    blg_raw
+                } else {
+                    stdout.to_string()
+                };
+                if !combined_bib.trim().is_empty() {
+                    log_text.push_str(combined_bib.trim());
+                    log_text.push('\n');
+                }
+                if !output.status.success() {
+                    let only_missing_bib = (combined_bib.contains("I found no \\citation commands")
+                        || combined_bib.contains("I found no \\bibdata command")
+                        || combined_bib.contains("I found no \\bibstyle command"))
+                        && !combined_bib.contains("error message");
+                    if only_missing_bib {
+                        log_text.push_str(
+                            "(Nota: nessuna citazione nel capitolo — passo BibTeX ignorato.)\n",
+                        );
+                    } else {
+                        diagnostics.push(CompileDiagnostic {
+                            line: None,
+                            title: "Errore BibTeX nella bibliografia".to_string(),
+                            explanation: "Controlla i file .bib e \\cite{...}.".to_string(),
+                            raw_excerpt: combined_bib
+                                .lines()
+                                .take(8)
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        });
+                        pipeline_ok = false;
+                        break;
+                    }
+                }
+                let _ = stderr;
+            }
+            RecipeStep::Biber => {
+                let bcf_path = iso_dir.join(format!("{iso_stem}.bcf"));
+                if !bcf_path.exists() {
+                    log_text.push_str("(Nessun file .bcf trovato — passo Biber saltato.)\n");
+                    continue;
+                }
+                let output =
+                    run_biber_step(&work_dir, &iso_dir, &search_dirs, &iso_stem).await?;
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !stdout.trim().is_empty() {
+                    log_text.push_str(stdout.trim());
+                    log_text.push('\n');
+                }
+                if !stderr.trim().is_empty() {
+                    log_text.push_str(stderr.trim());
+                    log_text.push('\n');
+                }
+                if !output.status.success() {
+                    let combined_biber = format!("{stdout}\n{stderr}");
+                    if combined_biber.contains("does not contain any citations")
+                        && !combined_biber.contains("ERROR")
+                    {
+                        log_text.push_str(
+                            "(Nota: nessuna citazione nel capitolo — passo Biber saltato.)\n",
+                        );
+                    } else {
+                        diagnostics.push(CompileDiagnostic {
+                            line: None,
+                            title: "Errore Biber nella bibliografia".to_string(),
+                            explanation:
+                                "Verifica che il preambolo usi biblatex e che il file .bib sia accessibile."
+                                    .to_string(),
+                            raw_excerpt: combined_biber
+                                .lines()
+                                .take(8)
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        });
+                        pipeline_ok = false;
+                        break;
+                    }
+                }
+            }
+            RecipeStep::MakeGlossaries => {
+                let output = run_makeglossaries_step(&work_dir, &iso_dir, &iso_stem).await?;
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let combined = format!("{stdout}\n{stderr}");
+                if !output.status.success()
+                    && !combined.contains("doesn't have a .glo file")
+                    && !combined.contains("Nothing to do")
+                {
+                    diagnostics.push(CompileDiagnostic {
+                        line: None,
+                        title: "Errore makeglossaries".to_string(),
+                        explanation: "Controlla i comandi \\newglossaryentry.".to_string(),
+                        raw_excerpt: combined.lines().take(6).collect::<Vec<_>>().join("\n"),
+                    });
+                    pipeline_ok = false;
+                    break;
+                }
+            }
+            RecipeStep::MakeIndex => {
+                let idx_path = iso_dir.join(format!("{iso_stem}.idx"));
+                if !idx_path.exists() {
+                    log_text.push_str("(Nessun file .idx trovato — passo MakeIndex saltato.)\n");
+                    continue;
+                }
+                let output = run_makeindex_step(&iso_dir, &iso_stem).await?;
+                if !output.status.success() {
+                    pipeline_ok = false;
+                    break;
+                }
+            }
+            RecipeStep::LatexMkPdf | RecipeStep::LatexMkLua | RecipeStep::LatexMkXe => {
+                let flag = match step {
+                    RecipeStep::LatexMkLua => "-lualatex",
+                    RecipeStep::LatexMkXe => "-xelatex",
+                    _ => "-pdf",
+                };
+                let output = run_latexmk_step(
+                    flag,
+                    &work_dir,
+                    &iso_dir,
+                    &search_dirs,
+                    &iso_tex_arg,
+                    shell_escape,
+                )
+                .await?;
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if output.status.success() {
+                    if !stdout.trim().is_empty() {
+                        log_text.push_str(stdout.trim());
+                        log_text.push('\n');
+                    }
+                } else {
+                    let raw_log = read_log_lossy(&log_file).await;
+                    append_tex_failure_logs(
+                        &mut log_text,
+                        "latexmk",
+                        raw_log.as_deref(),
+                        &stdout,
+                        &stderr,
+                        &mut diagnostics,
+                    );
+                    pipeline_ok = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    let iso_pdf = iso_dir.join(format!("{iso_stem}.pdf"));
+    let success = pipeline_ok && iso_pdf.exists();
+    let pdf_path = if success { Some(iso_pdf) } else { None };
+
+    let mut sync_target = None;
+    let (
+        total_pages,
+        page_aspect_ratio,
+        page_width_pts,
+        page_height_pts,
+        initial_pages,
+        preview_note,
+    ) = match &pdf_path {
+        Some(pdf) => match pdf_metadata(pdf).await {
+            Ok((pages_count, aspect, width_pts, height_pts)) if pages_count > 0 => {
+                sync_target =
+                    synctex_forward_search(&canon_tex, pdf, sync_line, height_pts, pages_count)
+                        .await;
+                let anchor_page = sync_target
+                    .map(|t| t.page)
+                    .unwrap_or(fallback_page)
+                    .clamp(1, pages_count);
+                let start = anchor_page.saturating_sub(1).max(1);
+                let end = (anchor_page + 1).min(pages_count);
+                let to_render: Vec<usize> = (start..=end).collect();
+                let target_h = ((target_width_px as f32) * aspect).round().max(100.0) as u32;
+                match render_pages_parallel(pdf.clone(), to_render, target_width_px, target_h)
+                    .await
+                {
+                    Ok(rendered) => (pages_count, aspect, width_pts, height_pts, rendered, None),
+                    Err(err) => (
+                        pages_count,
+                        aspect,
+                        width_pts,
+                        height_pts,
+                        Vec::new(),
+                        Some(err),
+                    ),
+                }
+            }
+            Ok(_) => (0, 1.4142, 595.28, 841.89, Vec::new(), None),
+            Err(err) => (0, 1.4142, 595.28, 841.89, Vec::new(), Some(err)),
+        },
+        None => (0, 1.4142, 595.28, 841.89, Vec::new(), None),
+    };
+
+    Ok(CompileResult {
+        success,
+        pdf_path,
+        total_pages,
+        page_aspect_ratio,
+        page_width_pts,
+        page_height_pts,
+        initial_pages,
+        sync_target,
+        diagnostics,
+        preview_note,
+        log: log_text,
+        elapsed_secs: started.elapsed().as_secs_f32(),
+    })
 }
 
 fn extract_errors(raw_log: &str) -> String {
@@ -2470,16 +3565,20 @@ SyncTeX result end
     #[test]
     fn remaps_shadow_live_tex_path_back_to_source() {
         let dir = std::env::temp_dir().join("feathertex_live_remap_test");
-        let live_dir = dir.join(".build").join("live");
-        let _ = std::fs::create_dir_all(&live_dir);
-        let real = dir.join("notes.tex");
+        let _ = std::fs::remove_dir_all(&dir);
+        let proj = dir.join("proj");
+        let live_dir = dir.join("live");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::create_dir_all(&live_dir).unwrap();
+        let real = proj.join("notes.tex");
         let shadow = live_dir.join("notes.tex");
+        let body = live_dir.join("notes_body.tex");
         std::fs::write(&real, "").unwrap();
         std::fs::write(&shadow, "").unwrap();
+        std::fs::write(&body, "").unwrap();
+        std::fs::write(live_dir.join(".origin"), proj.to_string_lossy().as_bytes()).unwrap();
 
         assert_eq!(remap_live_tex_path(shadow), real);
-        let body = dir.join(".build").join("notes_body.tex");
-        std::fs::write(&body, "").unwrap();
         assert_eq!(remap_live_tex_path(body), real);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2497,15 +3596,16 @@ SyncTeX result end
     }
 
     #[test]
-    fn promotes_staged_live_pdf_atomically_into_build_dir() {
+    fn promotes_staged_live_pdf_atomically_into_project_dir() {
         let dir = std::env::temp_dir().join("feathertex_promote_test");
-        let build = dir.join(".build");
-        let live = build.join("live");
-        let _ = std::fs::create_dir_all(&live);
+        let _ = std::fs::remove_dir_all(&dir);
+        let live = dir.join("live");
+        std::fs::create_dir_all(&live).unwrap();
         let live_pdf = live.join("doc.pdf");
         let live_sync = live.join("doc.synctex");
         std::fs::write(&live_pdf, b"%PDF-new").unwrap();
         std::fs::write(&live_sync, b"SyncTeX").unwrap();
+        std::fs::write(live.join(".origin"), dir.to_string_lossy().as_bytes()).unwrap();
 
         let staged = CompileResult {
             success: true,
@@ -2523,10 +3623,10 @@ SyncTeX result end
         };
 
         let promoted = promote_staged_live_result(staged).expect("promoted");
-        let expected_pdf = build.join("doc.pdf");
+        let expected_pdf = dir.join("output").join("pdf").join("doc.pdf");
         assert_eq!(promoted.pdf_path, Some(expected_pdf.clone()));
         assert_eq!(std::fs::read(&expected_pdf).unwrap(), b"%PDF-new");
-        assert!(build.join("doc.synctex").exists());
+        assert!(dir.join("output").join("synctex").join("doc.synctex").exists());
         assert!(!live_pdf.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2571,11 +3671,17 @@ SyncTeX result end
         };
 
         let promoted = promote_staged_live_result(staged).expect("promoted from origin");
-        let build = proj.join(".build");
-        assert_eq!(promoted.pdf_path, Some(build.join("thesis.pdf")));
-        assert_eq!(std::fs::read(build.join("thesis.pdf")).unwrap(), b"%PDF-ram");
-        assert!(build.join("thesis.synctex").exists());
-        assert!(build.join("thesis.aux").exists());
+        let out_dir = proj.join("output");
+        assert_eq!(
+            promoted.pdf_path,
+            Some(out_dir.join("pdf").join("thesis.pdf"))
+        );
+        assert_eq!(
+            std::fs::read(out_dir.join("pdf").join("thesis.pdf")).unwrap(),
+            b"%PDF-ram"
+        );
+        assert!(out_dir.join("synctex").join("thesis.synctex").exists());
+        assert!(out_dir.join("ausiliari").join("thesis.aux").exists());
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -2709,10 +3815,20 @@ SyncTeX result end
         assert!(res.pdf_path.as_ref().is_some_and(|p| p.exists()));
         assert!(res.log.contains("=== [2/4] BibTeX ==="));
         assert!(res.log.contains("=== !TeX root attivo:"));
-        assert!(dir.join(".build").join("main.bbl").exists());
+        assert!(dir.join("output").join("pdf").join("main.pdf").exists());
+        assert!(dir.join("output").join("bibliografia").join("main.bbl").exists());
+        assert!(dir.join("output").join("log").join("main.log").exists());
+        assert!(dir.join("output").join("ausiliari").join("main.aux").exists());
+        assert!(dir.join("output").join("synctex").join("main.synctex").exists());
+        // Project root stays completely clean of generated artifacts.
+        assert!(!dir.join("main.aux").exists());
+        assert!(!dir.join("main.bbl").exists());
+        assert!(!dir.join("main.log").exists());
+        assert!(!dir.join("main.pdf").exists());
+        assert!(!dir.join(".build").exists());
 
         // Also verify default single-step `pdfLaTeX` auto-runs BibTeX + pinned `master_override`
-        let _ = std::fs::remove_dir_all(dir.join(".build"));
+        let _ = std::fs::remove_dir_all(dir.join("output"));
         let cap2_path = chap_dir.join("cap2.tex");
         std::fs::write(&cap2_path, " Capitolo senza magic comment.\n").unwrap();
         let default_recipe = crate::recipes::builtin_recipes().into_iter().next().unwrap();
@@ -2729,8 +3845,153 @@ SyncTeX result end
             .expect("auto bib + master override");
         assert!(auto_res.success, "auto bib failed:\n{}", auto_res.log);
         assert!(auto_res.log.contains("=== [auto] BibTeX ==="));
-        assert!(dir.join(".build").join("main.bbl").exists());
+        assert!(dir.join("output").join("bibliografia").join("main.bbl").exists());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tikz_preamble_skips_fmt_precompilation() {
+        let tikz_pre = "\\documentclass{article}\n\\usepackage{tikz}\n\\usepackage{tikz-cd}\n";
+        assert!(!preamble_supports_fmt(tikz_pre));
+        let plain_pre = "\\documentclass{article}\n% \\usepackage{tikz}\n\\usepackage{amsmath}\n";
+        assert!(preamble_supports_fmt(plain_pre));
+    }
+
+    #[test]
+    fn compiles_isolated_chapter_borrowing_master_preamble() {
+        if std::process::Command::new("pdflatex").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join("feathertex_iso_chapter_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let main_path = dir.join("main.tex");
+        std::fs::write(
+            &main_path,
+            "\\documentclass{article}\n\\newcommand{\\mygreeting}{CiaoIsolato}\n\\begin{document}\n\\input{cap1}\n\\end{document}\n",
+        )
+        .unwrap();
+
+        let cap1_src = "% !TeX root = main.tex\n\\section{Uno}\n\\mygreeting\n";
+        let cap1_path = dir.join("cap1.tex");
+        std::fs::write(&cap1_path, cap1_src).unwrap();
+
+        let default_recipe = crate::recipes::builtin_recipes().into_iter().next().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let res = rt
+            .block_on(compile_isolated_file(
+                cap1_path.clone(),
+                cap1_src.to_string(),
+                None,
+                default_recipe,
+                false,
+                Vec::new(),
+                2,
+                1,
+                500,
+            ))
+            .expect("isolated compilation result");
+
+        assert!(res.success, "expected isolated success, log:\n{}", res.log);
+        assert!(res.total_pages >= 1);
+        let pdf = res.pdf_path.as_ref().expect("isolated PDF path");
+        assert!(pdf.exists());
+        if let Some(rev) = rt.block_on(synctex_reverse_search(pdf, 1, 150.0, 150.0)) {
+            assert_eq!(
+                rev.file_path,
+                std::fs::canonicalize(&cap1_path).unwrap_or(cap1_path)
+            );
+        }
+        // Must not pollute project dir with cap1.pdf, .build, or output/
+        assert!(!dir.join("cap1.pdf").exists());
+        assert!(!dir.join("output").exists());
+        assert!(!dir.join(".build").exists());
+
+        if let Some(iso_dir) = pdf.parent() {
+            let _ = std::fs::remove_dir_all(iso_dir);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compiles_isolated_dotted_chapter_with_lualatex_biber_recipe() {
+        if std::process::Command::new("lualatex").arg("--version").output().is_err()
+            || std::process::Command::new("biber").arg("--version").output().is_err()
+        {
+            return;
+        }
+        let dir = std::env::temp_dir().join("feathertex_iso_lualatex_biber_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let bib_path = dir.join("Bibliografia.bib");
+        std::fs::write(
+            &bib_path,
+            "@book{hartshorne1977,\n  author={Robin Hartshorne},\n  title={Algebraic Geometry},\n  year={1977}\n}\n",
+        )
+        .unwrap();
+
+        let main_path = dir.join("main.tex");
+        std::fs::write(
+            &main_path,
+            "\\documentclass{book}\n\\usepackage{amsmath,amssymb,amsthm}\n\\usepackage[backend=biber,style=alphabetic]{biblatex}\n\\addbibresource{Bibliografia.bib}\n\\usepackage{fontspec}\n\\newtheorem{definition}{Definition}\n\\DeclareMathOperator{\\Sym}{Sym}\n\\begin{document}\n\\include{Chp_1.1}\n\\end{document}\n",
+        )
+        .unwrap();
+
+        // Mirrors the user's `Chp_1.1.tex`: dotted filename, no `\documentclass`, no `!TeX root`.
+        let chp_src = "\\section{The Symmetric Algebra}\n\\begin{definition}\nWe consider $\\Sym_A(M)$.\n\\end{definition}\n";
+        let chp_path = dir.join("Chp_1.1.tex");
+        std::fs::write(&chp_path, chp_src).unwrap();
+
+        let lualatex_biber_recipe = CompileRecipe {
+            id: "custom_lualatex_biber".to_string(),
+            name: "LuaLaTeX + Biber".to_string(),
+            steps: vec![
+                RecipeStep::LuaLatex,
+                RecipeStep::Biber,
+                RecipeStep::LuaLatex,
+                RecipeStep::LuaLatex,
+            ],
+            builtin: false,
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let res = rt
+            .block_on(compile_isolated_file(
+                chp_path.clone(),
+                chp_src.to_string(),
+                None,
+                lualatex_biber_recipe,
+                false,
+                Vec::new(),
+                2,
+                1,
+                500,
+            ))
+            .expect("isolated dotted chapter result");
+
+        assert!(res.success, "expected isolated success, log:\n{}", res.log);
+        assert!(res.total_pages >= 1);
+        let pdf = res.pdf_path.clone().expect("isolated PDF path");
+        assert!(pdf.exists());
+        assert_eq!(
+            pdf.file_name().and_then(|n| n.to_str()),
+            Some("Chp_1_1_iso.pdf")
+        );
+        if let Some(rev) = rt.block_on(synctex_reverse_search(&pdf, 1, 150.0, 200.0)) {
+            assert_eq!(
+                rev.file_path,
+                std::fs::canonicalize(&chp_path).unwrap_or(chp_path)
+            );
+        }
+        assert!(!dir.join("Chp_1.1.pdf").exists());
+        assert!(!dir.join("output").exists());
+
+        if let Some(iso_dir) = pdf.parent() {
+            let _ = std::fs::remove_dir_all(iso_dir);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2763,6 +4024,9 @@ SyncTeX result end
         assert!(res.success, "expected lualatex success, log:\n{}", res.log);
         assert!(res.log.contains("=== [1/1] LuaLaTeX ==="));
         assert!(res.pdf_path.as_ref().is_some_and(|p| p.exists()));
+        assert!(dir.join("output").join("pdf").join("lua_doc.pdf").exists());
+        assert!(dir.join("output").join("log").join("lua_doc.log").exists());
+        assert!(!dir.join("lua_doc.log").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

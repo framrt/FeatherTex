@@ -7,6 +7,7 @@ pub struct UserSettings {
     pub editor_font_size: f32,
     pub auto_close: bool,
     pub live_compile: bool,
+    pub pdf_magnifier: bool,
     pub spell_lang: String,
 }
 
@@ -17,6 +18,7 @@ impl Default for UserSettings {
             editor_font_size: 16.0,
             auto_close: true,
             live_compile: true,
+            pdf_magnifier: false,
             spell_lang: "it_IT".to_string(),
         }
     }
@@ -28,8 +30,13 @@ fn settings_path() -> Option<PathBuf> {
 
 pub fn serialize_settings(s: &UserSettings) -> String {
     format!(
-        "dark_mode={}\neditor_font_size={:.1}\nauto_close={}\nlive_compile={}\nspell_lang={}\n",
-        s.dark_mode, s.editor_font_size, s.auto_close, s.live_compile, s.spell_lang
+        "dark_mode={}\neditor_font_size={:.1}\nauto_close={}\nlive_compile={}\npdf_magnifier={}\nspell_lang={}\n",
+        s.dark_mode,
+        s.editor_font_size,
+        s.auto_close,
+        s.live_compile,
+        s.pdf_magnifier,
+        s.spell_lang
     )
 }
 
@@ -50,6 +57,8 @@ pub fn parse_settings(raw: &str) -> UserSettings {
             out.auto_close = matches!(v.trim(), "true" | "1" | "yes");
         } else if let Some(v) = trimmed.strip_prefix("live_compile=") {
             out.live_compile = matches!(v.trim(), "true" | "1" | "yes");
+        } else if let Some(v) = trimmed.strip_prefix("pdf_magnifier=") {
+            out.pdf_magnifier = matches!(v.trim(), "true" | "1" | "yes");
         } else if let Some(v) = trimmed.strip_prefix("spell_lang=") {
             let lang = v.trim();
             if !lang.is_empty() {
@@ -91,6 +100,7 @@ mod tests {
             editor_font_size: 21.0,
             auto_close: false,
             live_compile: false,
+            pdf_magnifier: true,
             spell_lang: "en_US".to_string(),
         };
         let txt = serialize_settings(&s);

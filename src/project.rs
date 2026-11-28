@@ -1164,7 +1164,7 @@ fn collect_tex_files_recursive(dir: &Path, depth: usize, out: &mut Vec<PathBuf>)
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if name.starts_with('.') || name == "target" {
+        if name.starts_with('.') || name == "target" || name == "output" {
             continue;
         }
         if path.is_dir() {
@@ -2089,6 +2089,7 @@ pub async fn fetch_bibtex_entry(raw_input: String) -> Result<(String, BibEntry),
     })?;
 
     let mut cmd = tokio::process::Command::new("curl");
+    crate::compiler::hide_console_window(&mut cmd);
     cmd.kill_on_drop(true).args([
         "-sSL",
         "--fail",
@@ -2292,10 +2293,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::create_dir_all(dir.join(".build")).unwrap();
+        std::fs::create_dir_all(dir.join("output").join("diff")).unwrap();
 
         std::fs::write(dir.join("a.tex"), "Primo \\alpha teorema\n").unwrap();
         std::fs::write(dir.join("sub").join("b.tex"), "Secondo \\ALPHA lemma\n").unwrap();
         std::fs::write(dir.join(".build").join("ignored.tex"), "\\alpha\n").unwrap();
+        std::fs::write(
+            dir.join("output").join("diff").join("ignored.tex"),
+            "\\alpha\n",
+        )
+        .unwrap();
 
         let hits = search_in_folder(
             &dir,

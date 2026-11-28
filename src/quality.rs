@@ -79,7 +79,9 @@ pub async fn run_texcount(
     if use_disk_inc {
         if let Some(ref path) = root_file {
             if let Some(parent) = path.parent() {
-                if let Ok(out) = Command::new("texcount")
+                let mut cmd = Command::new("texcount");
+                crate::compiler::hide_console_window(&mut cmd);
+                if let Ok(out) = cmd
                     .current_dir(parent)
                     .kill_on_drop(true)
                     .args(["-inc", "-brief", "-total", "-1"])
@@ -96,7 +98,9 @@ pub async fn run_texcount(
         }
     }
 
-    let mut child = Command::new("texcount")
+    let mut tc_cmd = Command::new("texcount");
+    crate::compiler::hide_console_window(&mut tc_cmd);
+    let mut child = tc_cmd
         .kill_on_drop(true)
         .args(["-brief", "-total", "-1", "-"])
         .stdin(Stdio::piped())
@@ -226,7 +230,9 @@ pub fn parse_chktex_output(stdout: &str) -> Vec<LintWarning> {
 }
 
 pub async fn run_chktex(source: String) -> Result<Vec<LintWarning>, String> {
-    let mut child = Command::new("chktex")
+    let mut cmd = Command::new("chktex");
+    crate::compiler::hide_console_window(&mut cmd);
+    let mut child = cmd
         .kill_on_drop(true)
         .args(["-q", "-f", "%l:%c:%n:%k:%m\n"])
         .stdin(Stdio::piped())
@@ -620,7 +626,9 @@ pub async fn run_hunspell(source: String, lang: String) -> SpellCheckOutcome {
         payload.push('\n');
     }
 
-    let mut child = match Command::new("hunspell")
+    let mut cmd = Command::new("hunspell");
+    crate::compiler::hide_console_window(&mut cmd);
+    let mut child = match cmd
         .kill_on_drop(true)
         .args(["-a", "-d", &lang])
         .stdin(Stdio::piped())
@@ -713,7 +721,7 @@ pub async fn run_hunspell(source: String, lang: String) -> SpellCheckOutcome {
 // `latexdiff` Revision Generator (vs Git HEAD or previous `.tex` file)
 // ============================================================================
 
-/// Generates `.build/<stem>_diff.tex` comparing `old_tex_path` against `current_tex_path`.
+/// Generates `<parent>/output/diff/<stem>_diff.tex` comparing `old_tex_path` against `current_tex_path`.
 pub async fn generate_latexdiff_tex(
     old_tex_path: &Path,
     current_tex_path: &Path,
@@ -725,12 +733,10 @@ pub async fn generate_latexdiff_tex(
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("documento");
-    let build_dir = parent_dir.join(".build");
-    tokio::fs::create_dir_all(&build_dir)
-        .await
-        .map_err(|e| format!("Impossibile creare .build: {e}"))?;
 
-    let out = Command::new("latexdiff")
+    let mut cmd = Command::new("latexdiff");
+    crate::compiler::hide_console_window(&mut cmd);
+    let out = cmd
         .current_dir(parent_dir)
         .kill_on_drop(true)
         .arg("--flatten")
@@ -751,14 +757,18 @@ pub async fn generate_latexdiff_tex(
         return Err(format!("Errore latexdiff: {}", stderr.trim()));
     }
 
-    let diff_tex = build_dir.join(format!("{stem}_diff.tex"));
+    let diff_dir = parent_dir.join("output").join("diff");
+    tokio::fs::create_dir_all(&diff_dir)
+        .await
+        .map_err(|e| format!("Impossibile creare output/diff: {e}"))?;
+    let diff_tex = diff_dir.join(format!("{stem}_diff.tex"));
     tokio::fs::write(&diff_tex, &out.stdout)
         .await
         .map_err(|e| format!("Impossibile salvare il file diff: {e}"))?;
     Ok(diff_tex)
 }
 
-/// Extracts `HEAD:<rel_path>` from Git into `.build/<stem>_git_head.tex` and runs `latexdiff`.
+/// Extracts `HEAD:<rel_path>` from Git into a temporary snapshot and runs `latexdiff`.
 pub async fn generate_latexdiff_against_git_head(current_tex_path: PathBuf) -> Result<PathBuf, String> {
     let parent_dir = current_tex_path
         .parent()
@@ -768,7 +778,9 @@ pub async fn generate_latexdiff_against_git_head(current_tex_path: PathBuf) -> R
         .and_then(|s| s.to_str())
         .unwrap_or("documento");
 
-    let top_out = Command::new("git")
+    let mut top_cmd = Command::new("git");
+    crate::compiler::hide_console_window(&mut top_cmd);
+    let top_out = top_cmd
         .current_dir(parent_dir)
         .args(["rev-parse", "--show-toplevel"])
         .output()
@@ -777,8 +789,7 @@ pub async fn generate_latexdiff_against_git_head(current_tex_path: PathBuf) -> R
 
     if !top_out.status.success() {
         return Err(
-            " Questa cartella non è un repository Git. Usa 'Confronta con file .tex...' per scegliere una versione precedente."
-                .trim()
+            "Questa cartella non è un repository Git. Usa 'Confronta con file .tex...' per scegliere una versione precedente."
                 .to_string(),
         );
     }
@@ -792,7 +803,9 @@ pub async fn generate_latexdiff_against_git_head(current_tex_path: PathBuf) -> R
         .map_err(|_| "Impossibile calcolare il percorso relativo nel repository Git".to_string())?;
 
     let git_spec = format!("HEAD:{}", rel_path.to_string_lossy().replace('\\', "/"));
-    let show_out = Command::new("git")
+    let mut show_cmd = Command::new("git");
+    crate::compiler::hide_console_window(&mut show_cmd);
+    let show_out = show_cmd
         .current_dir(&canon_root)
         .args(["show", &git_spec])
         .output()
@@ -806,11 +819,11 @@ pub async fn generate_latexdiff_against_git_head(current_tex_path: PathBuf) -> R
         ));
     }
 
-    let build_dir = parent_dir.join(".build");
-    tokio::fs::create_dir_all(&build_dir)
+    let diff_tmp_dir = std::env::temp_dir().join("feathertex_diff");
+    tokio::fs::create_dir_all(&diff_tmp_dir)
         .await
-        .map_err(|e| format!("Impossibile creare .build: {e}"))?;
-    let old_path = build_dir.join(format!("{stem}_git_head.tex"));
+        .map_err(|e| format!("Impossibile creare cartella temporanea diff: {e}"))?;
+    let old_path = diff_tmp_dir.join(format!("{stem}_git_head.tex"));
     tokio::fs::write(&old_path, &show_out.stdout)
         .await
         .map_err(|e| format!("Impossibile scrivere snapshot Git: {e}"))?;
@@ -818,7 +831,7 @@ pub async fn generate_latexdiff_against_git_head(current_tex_path: PathBuf) -> R
     generate_latexdiff_tex(&old_path, &current_tex_path).await
 }
 
-/// Opens a file dialog to select an older `.tex` version and generates `.build/<stem>_diff.tex`.
+/// Opens a file dialog to select an older `.tex` version and generates `<parent>/<stem>_diff.tex`.
 pub async fn pick_old_tex_and_latexdiff(current_tex_path: PathBuf) -> Result<PathBuf, String> {
     let handle = rfd::AsyncFileDialog::new()
         .set_title("Seleziona la versione precedente (.tex) per latexdiff")
@@ -932,7 +945,9 @@ fn extract_release_asset_urls(json: &str) -> (Option<String>, Option<String>, Op
 
 pub async fn check_for_update() -> Option<UpdateInfo> {
     let url = "https://api.github.com/repos/framrt/FeatherTex/releases/latest";
-    let curl_out = Command::new("curl")
+    let mut curl_cmd = Command::new("curl");
+    crate::compiler::hide_console_window(&mut curl_cmd);
+    let curl_out = curl_cmd
         .kill_on_drop(true)
         .args([
             "-sSL",
@@ -1000,7 +1015,9 @@ pub async fn check_for_update() -> Option<UpdateInfo> {
 }
 
 async fn download_https_to_file(url: &str, dest: &Path) -> Result<(), String> {
-    let curl_res = Command::new("curl")
+    let mut curl_cmd = Command::new("curl");
+    crate::compiler::hide_console_window(&mut curl_cmd);
+    let curl_res = curl_cmd
         .kill_on_drop(true)
         .args([
             "-sSL",

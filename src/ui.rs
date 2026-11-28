@@ -8,10 +8,10 @@ use crate::symbols::{
 };
 use crate::syntax::{LatexHighlightSettings, LatexHighlighter, Token};
 use crate::theme;
-use crate::{App, LogTab, Message, PdfContextMenu, Screen};
+use crate::{App, LogTab, Message, PdfContextMenu, PdfMagnifierHover, Screen};
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::renderer::{self, Renderer as _};
-use iced::advanced::widget::{Operation, Tree, Widget};
+use iced::advanced::widget::{tree, Operation, Tree, Widget};
 use iced::advanced::{Clipboard, Shell};
 use iced::event::{self, Event};
 use iced::mouse;
@@ -384,7 +384,32 @@ fn view_welcome(app: &App) -> Element<'_, Message> {
     .padding([14, 20])
     .width(Length::Fill);
 
-    container(stack![centered_card, theme_overlay])
+    let author_footer = container(
+        button(
+            row![
+                text("Creato da").size(11).color(pal.text_faint),
+                text("framrt")
+                    .font(theme::ui_font_semibold())
+                    .size(11)
+                    .color(pal.accent),
+                text("· GitHub ↗")
+                    .font(theme::math_symbol_font())
+                    .shaping(Shaping::Advanced)
+                    .size(11)
+                    .color(pal.text_muted),
+            ]
+            .spacing(5)
+            .align_y(Alignment::Center),
+        )
+        .padding([5, 12])
+        .style(theme::ghost_button)
+        .on_press(Message::OpenAuthorProfile),
+    )
+    .width(Length::Fill)
+    .center_x(Length::Fill)
+    .padding([12, 20]);
+
+    container(column![theme_overlay, centered_card, author_footer])
         .width(Length::Fill)
         .height(Length::Fill)
         .style(theme::app_background)
@@ -475,6 +500,32 @@ fn view_editor(app: &App) -> Element<'_, Message> {
             .padding([6, 15])
             .style(theme::primary_button)
             .on_press(Message::Compile)
+    };
+
+    let iso_label = if app.is_isolated_compiling {
+        "Isolato..."
+    } else if app.window_size.width < 1040.0 {
+        "Isolato"
+    } else {
+        "Compila isolato"
+    };
+    let isolate_btn = if app.is_isolated_compiling {
+        button(text(iso_label).size(12))
+            .padding(if app.window_size.width < 1040.0 {
+                [4, 7]
+            } else {
+                [5, 10]
+            })
+            .style(theme::symbol_button)
+    } else {
+        button(text(iso_label).size(12))
+            .padding(if app.window_size.width < 1040.0 {
+                [4, 7]
+            } else {
+                [5, 10]
+            })
+            .style(theme::symbol_button)
+            .on_press(Message::CompileIsolated)
     };
 
     let brand_pill = image(app_icon_handle())
@@ -608,6 +659,7 @@ fn view_editor(app: &App) -> Element<'_, Message> {
             .on_press(Message::ToggleLiveCompile),
             Space::with_width(if compact_bar { 2 } else { 4 }),
             recipe_btn,
+            isolate_btn,
             compile_btn,
         ]
         .spacing(bar_spacing)
@@ -775,6 +827,8 @@ fn view_editor(app: &App) -> Element<'_, Message> {
         status_bar,
     ];
 
+    let has_menu_overlay =
+        app.pdf_context_menu.is_some() || app.show_folder_menu || app.show_recipe_menu;
     let overlay: Element<'_, Message> = if let Some(menu) = app.pdf_context_menu {
         view_pdf_context_menu(app, menu)
     } else if app.show_folder_menu {
@@ -785,9 +839,20 @@ fn view_editor(app: &App) -> Element<'_, Message> {
         container(Space::new(0, 0)).into()
     };
 
+    let magnifier_overlay: Element<'_, Message> =
+        if !has_menu_overlay && app.pdf_magnifier_enabled && app.show_pdf {
+            if let Some(hover) = app.pdf_magnifier_hover {
+                view_pdf_magnifier_overlay(app, hover)
+            } else {
+                container(Space::new(0, 0)).into()
+            }
+        } else {
+            container(Space::new(0, 0)).into()
+        };
+
     // Always keep `stack!` as the root so opening/closing overlays never resets
     // scrollable offsets or editor focus state inside `main_layout`.
-    stack![main_layout, overlay].into()
+    stack![main_layout, overlay, magnifier_overlay].into()
 }
 
 fn view_file_tab_bar(app: &App) -> Element<'_, Message> {
@@ -2348,6 +2413,12 @@ fn view_pdf_panel(app: &App) -> Element<'_, Message> {
     if tab.last_pdf.is_some() {
         header_row = header_row
             .push(
+                button(text("Lente").size(11))
+                    .padding(hdr_btn_pad)
+                    .style(theme::toggle_toolbar_button(app.pdf_magnifier_enabled))
+                    .on_press(Message::TogglePdfMagnifier),
+            )
+            .push(
                 button(text("Sync").size(11))
                     .padding(hdr_btn_pad)
                     .style(theme::ghost_button)
@@ -2378,11 +2449,9 @@ fn view_pdf_panel(app: &App) -> Element<'_, Message> {
         let skip_before = first_vis.saturating_sub(1);
         let skip_after = tab.pdf_total_pages.saturating_sub(last_vis);
         let needs_h_scroll = app.pdf_zoom > 1.001;
-        let filter = if app.pdf_cache_width == app.target_pdf_render_width() {
-            image::FilterMethod::Nearest
-        } else {
-            image::FilterMethod::Linear
-        };
+        // 2x supersampled page textures downsample cleanly with Linear filtering,
+        // eliminating jagged thin strokes in TikZ / tikz-cd diagrams on Windows & Linux.
+        let filter = image::FilterMethod::Linear;
 
         let mut pages_col = Column::new()
             .spacing(PDF_PAGE_SPACING)
@@ -2429,6 +2498,7 @@ fn view_pdf_panel(app: &App) -> Element<'_, Message> {
                 inner,
                 page_num,
                 tab.pdf_scroll_offset,
+                app.pdf_magnifier_enabled,
                 |page, x_ratio, y_ratio| Message::PdfLeftClicked {
                     page,
                     x_ratio,
@@ -2440,6 +2510,15 @@ fn view_pdf_panel(app: &App) -> Element<'_, Message> {
                     y_ratio,
                     anchor,
                 },
+                move |page, x_ratio, y_ratio, window_pos| Message::PdfMagnifierMoved {
+                    page,
+                    x_ratio,
+                    y_ratio,
+                    window_pos,
+                    page_width,
+                    page_height,
+                },
+                || Message::PdfMagnifierLeft,
             )
             .into();
 
@@ -2522,15 +2601,19 @@ fn view_pdf_panel(app: &App) -> Element<'_, Message> {
     .into()
 }
 
-/// Thin widget wrapper around a rendered PDF page that captures click coordinates:
+/// Thin widget wrapper around a rendered PDF page that captures click coordinates and hover:
 /// - Left-click teleports straight to the corresponding LaTeX source line via SyncTeX.
 /// - Right-click opens the context menu ("Visualizza codice sorgente") at true window coordinates.
+/// - Hover updates the TeXstudio-style magnifier loupe when `magnifier_enabled` is true.
 struct PdfPageArea<'a, Message> {
     content: Element<'a, Message>,
     page_number: usize,
     scroll_offset: scrollable::AbsoluteOffset,
+    magnifier_enabled: bool,
     on_left_click: Box<dyn Fn(usize, f32, f32) -> Message + 'a>,
     on_right_click: Box<dyn Fn(usize, f32, f32, Point) -> Message + 'a>,
+    on_hover: Box<dyn Fn(usize, f32, f32, Point) -> Message + 'a>,
+    on_leave: Box<dyn Fn() -> Message + 'a>,
 }
 
 impl<'a, Message> PdfPageArea<'a, Message> {
@@ -2538,20 +2621,34 @@ impl<'a, Message> PdfPageArea<'a, Message> {
         content: Element<'a, Message>,
         page_number: usize,
         scroll_offset: scrollable::AbsoluteOffset,
+        magnifier_enabled: bool,
         on_left_click: impl Fn(usize, f32, f32) -> Message + 'a,
         on_right_click: impl Fn(usize, f32, f32, Point) -> Message + 'a,
+        on_hover: impl Fn(usize, f32, f32, Point) -> Message + 'a,
+        on_leave: impl Fn() -> Message + 'a,
     ) -> Self {
         Self {
             content,
             page_number,
             scroll_offset,
+            magnifier_enabled,
             on_left_click: Box::new(on_left_click),
             on_right_click: Box::new(on_right_click),
+            on_hover: Box::new(on_hover),
+            on_leave: Box::new(on_leave),
         }
     }
 }
 
 impl<'a, Message> Widget<Message, Theme, iced::Renderer> for PdfPageArea<'a, Message> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<bool>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(false)
+    }
+
     fn children(&self) -> Vec<Tree> {
         vec![Tree::new(&self.content)]
     }
@@ -2629,6 +2726,36 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for PdfPageArea<'a, Mes
                     return event::Status::Captured;
                 }
             }
+            Event::Mouse(mouse::Event::CursorMoved { .. }) if self.magnifier_enabled => {
+                let hovered = tree.state.downcast_mut::<bool>();
+                if let (Some(local), Some(scrolled_pos)) =
+                    (cursor.position_in(bounds), cursor.position())
+                {
+                    *hovered = true;
+                    let x_ratio = (local.x / bounds.width.max(1.0)).clamp(0.0, 1.0);
+                    let y_ratio = (local.y / bounds.height.max(1.0)).clamp(0.0, 1.0);
+                    let window_pos = Point::new(
+                        scrolled_pos.x - self.scroll_offset.x,
+                        scrolled_pos.y - self.scroll_offset.y,
+                    );
+                    shell.publish((self.on_hover)(
+                        self.page_number,
+                        x_ratio,
+                        y_ratio,
+                        window_pos,
+                    ));
+                } else if *hovered {
+                    *hovered = false;
+                    shell.publish((self.on_leave)());
+                }
+            }
+            Event::Mouse(mouse::Event::CursorLeft) if self.magnifier_enabled => {
+                let hovered = tree.state.downcast_mut::<bool>();
+                if *hovered {
+                    *hovered = false;
+                    shell.publish((self.on_leave)());
+                }
+            }
             _ => {}
         }
 
@@ -2685,6 +2812,172 @@ impl<'a, Message: 'a> From<PdfPageArea<'a, Message>> for Element<'a, Message> {
     fn from(area: PdfPageArea<'a, Message>) -> Self {
         Element::new(area)
     }
+}
+
+/// Renders a child image/element translated to `(offset_x, offset_y)` inside a clipped box,
+/// powering the TeXstudio-style PDF magnifier loupe.
+struct Offset2D<'a, Message> {
+    content: Element<'a, Message>,
+    offset_x: f32,
+    offset_y: f32,
+}
+
+impl<'a, Message> Offset2D<'a, Message> {
+    fn new(content: Element<'a, Message>, offset_x: f32, offset_y: f32) -> Self {
+        Self {
+            content,
+            offset_x,
+            offset_y,
+        }
+    }
+}
+
+impl<'a, Message> Widget<Message, Theme, iced::Renderer> for Offset2D<'a, Message> {
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_ref(&self.content));
+    }
+
+    fn size(&self) -> Size<Length> {
+        Size::new(Length::Fill, Length::Fill)
+    }
+
+    fn layout(
+        &self,
+        tree: &mut Tree,
+        renderer: &iced::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        let size = limits.resolve(Length::Fill, Length::Fill, Size::ZERO);
+        let child_limits = layout::Limits::new(Size::ZERO, Size::INFINITY);
+        let child_node = self
+            .content
+            .as_widget()
+            .layout(&mut tree.children[0], renderer, &child_limits)
+            .move_to(Point::new(self.offset_x, self.offset_y));
+        layout::Node::with_children(size, vec![child_node])
+    }
+
+    fn operate(
+        &self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        if let Some(child_layout) = layout.children().next() {
+            self.content
+                .as_widget()
+                .operate(&mut tree.children[0], child_layout, renderer, operation);
+        }
+    }
+
+    fn on_event(
+        &mut self,
+        _tree: &mut Tree,
+        _event: Event,
+        _layout: Layout<'_>,
+        _cursor: mouse::Cursor,
+        _renderer: &iced::Renderer,
+        _clipboard: &mut dyn Clipboard,
+        _shell: &mut Shell<'_, Message>,
+        _viewport: &Rectangle,
+    ) -> event::Status {
+        event::Status::Ignored
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut iced::Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        let bounds = layout.bounds();
+        let Some(clipped) = viewport.intersection(&bounds) else {
+            return;
+        };
+        let Some(child_layout) = layout.children().next() else {
+            return;
+        };
+        renderer.with_layer(bounds, |renderer| {
+            self.content.as_widget().draw(
+                &tree.children[0],
+                renderer,
+                theme,
+                style,
+                child_layout,
+                cursor,
+                &clipped,
+            );
+        });
+    }
+}
+
+impl<'a, Message: 'a> From<Offset2D<'a, Message>> for Element<'a, Message> {
+    fn from(offset: Offset2D<'a, Message>) -> Self {
+        Element::new(offset)
+    }
+}
+
+fn view_pdf_magnifier_overlay(app: &App, hover: PdfMagnifierHover) -> Element<'_, Message> {
+    const LENS_W: f32 = 250.0;
+    const LENS_H: f32 = 176.0;
+    const LENS_ZOOM: f32 = 2.6;
+
+    let Some(handle) = app.pdf_page_cache.get(&hover.page) else {
+        return container(Space::new(0, 0)).into();
+    };
+
+    let img_w = (hover.page_width * LENS_ZOOM).max(LENS_W);
+    let img_h = (hover.page_height * LENS_ZOOM).max(LENS_H);
+    let inner_x = (LENS_W * 0.5) - (hover.x_ratio * img_w);
+    let inner_y = (LENS_H * 0.5) - (hover.y_ratio * img_h);
+
+    let left = (hover.window_pos.x - LENS_W * 0.5)
+        .clamp(8.0, (app.window_size.width - LENS_W - 8.0).max(8.0))
+        .round();
+    let top = if hover.window_pos.y > LENS_H + 34.0 {
+        hover.window_pos.y - LENS_H - 22.0
+    } else {
+        hover.window_pos.y + 24.0
+    }
+    .clamp(8.0, (app.window_size.height - LENS_H - 8.0).max(8.0))
+    .round();
+
+    let magnified: Element<'_, Message> = Offset2D::new(
+        image(handle.clone())
+            .width(Length::Fixed(img_w))
+            .height(Length::Fixed(img_h))
+            .filter_method(image::FilterMethod::Linear)
+            .into(),
+        inner_x,
+        inner_y,
+    )
+    .into();
+
+    let lens_box = container(magnified)
+        .width(Length::Fixed(LENS_W))
+        .height(Length::Fixed(LENS_H))
+        .clip(true)
+        .style(theme::popup_box);
+
+    container(lens_box)
+        .padding(Padding {
+            top,
+            left,
+            right: 0.0,
+            bottom: 0.0,
+        })
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
 }
 
 /// Positions its child vertically inside a clipped viewport, keeping the fixed left gutter
@@ -4230,7 +4523,7 @@ fn view_log_panel(app: &App) -> Element<'_, Message> {
                     .size(13)
                     .color(pal.text_primary),
                 horizontal_space(),
-                button(text("Pulisci .build").size(11))
+                button(text("Pulisci ausiliari").size(11))
                     .padding([3, 8])
                     .style(theme::ghost_button)
                     .on_press(Message::CleanBuild),
